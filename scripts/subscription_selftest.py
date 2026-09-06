@@ -33,6 +33,7 @@ calls=[]; app.apiSubscription=(r, cb)=>{ calls.push(r);cb({ok:true,generation:'s
 save(); assert.equal(calls.length,2); assert.deepEqual(calls[1],{action:'select',model:'gpt-5.6-luna',effort:'high',generation:'scope-A',activate:true});
 calls=[]; pending='handle'; cancel(); assert.equal(calls[0].pending,'handle'); assert.equal(calls[0].action,'cancel');
 alive=false; busy=true; call({action:'start'},()=>{throw Error('dead page callback')});
+page=null; call({action:'status'},()=>{throw Error('destroyed page callback')});
 console.log('Subscription QML handlers: failed probe, exact selection, cancellation and destroyed page PASS');
 '''
 subprocess.run(['node', '-e', js], check=True)
@@ -45,4 +46,5 @@ assert 'app.pushPage("SubscriptionPage.qml", {})' in quick
 provider = (root / 'qml/pages/ProviderPage.qml').read_text()
 assert 'ChatGPT subscription' in provider and 'OpenAI API (separate billing)' in provider
 assert 'subscription_setup.supported === true' in provider
+assert 'visible: !page.wizardMode && page.profileId !== \"chatgpt\"' in provider
 print('Subscription UI capability gating, API/provider separation and Quick Setup integration PASS')

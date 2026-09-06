@@ -17,7 +17,7 @@ Page {
     function call(request, done) {
         busy = true;
         app.apiSubscription(request, function(r) {
-            if (!page.alive) return;
+            if (!page || !page.alive) return;
             page.busy = false;
             if (!r || r.ok !== true) { page.message = page.app.describeError(r); return; }
             done(r);
@@ -88,10 +88,10 @@ Page {
             TextField { id: modelField; Layout.fillWidth: true; enabled: !page.busy; placeholderText: i18n.tr("Model, e.g. gpt-5.6-luna") }
             TextField { id: effortField; Layout.fillWidth: true; enabled: !page.busy; placeholderText: i18n.tr("Reasoning effort, e.g. high") }
             Label { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: i18n.tr("Stop Briglia before changing its active provider. An unmanaged terminal process must be stopped in its terminal. Restart after saving.") }
-            Button { Layout.fillWidth: true; text: i18n.tr("Stop background service"); enabled: !page.busy; onClicked: { page.busy = true; page.app.pyCall("systemctl_user", ["stop"], function(r) { page.busy = false; page.message = r && r.ok === true ? i18n.tr("Service stopped.") : page.app.describeError(r); page.app.refresh(); }); } }
+            Button { Layout.fillWidth: true; text: i18n.tr("Stop background service"); enabled: !page.busy; onClicked: { page.busy = true; page.app.pyCall("systemctl_user", ["stop"], function(r) { if (!page || !page.alive) return; page.busy = false; page.message = r && r.ok === true ? i18n.tr("Service stopped.") : page.app.describeError(r); page.app.refresh(); }); } }
             Button { Layout.fillWidth: true; text: i18n.tr("Verify model and use ChatGPT"); enabled: !page.busy && page.signedIn && !page.pending; onClicked: page.save() }
             Button { Layout.fillWidth: true; text: i18n.tr("Sign out locally"); enabled: !page.busy; onClicked: { poll.stop(); page.call({action: "logout"}, function() { page.pending = ""; page.loginCode = ""; page.status(); page.app.refresh(); }); } }
-            Button { Layout.fillWidth: true; text: i18n.tr("Start background service"); enabled: !page.busy; onClicked: { page.busy = true; page.app.pyCall("systemctl_user", ["start"], function(r) { page.busy = false; page.message = r && r.ok === true ? i18n.tr("Service started.") : page.app.describeError(r); page.app.refresh(); }); } }
+            Button { Layout.fillWidth: true; text: i18n.tr("Start background service"); enabled: !page.busy; onClicked: { page.busy = true; page.app.pyCall("systemctl_user", ["start"], function(r) { if (!page || !page.alive) return; page.busy = false; page.message = r && r.ok === true ? i18n.tr("Service started.") : page.app.describeError(r); page.app.refresh(); }); } }
             Button { Layout.fillWidth: true; text: i18n.tr("Back to setup"); enabled: !page.busy; onClicked: page.app.popPage() }
         }
     }

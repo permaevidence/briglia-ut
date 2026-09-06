@@ -443,7 +443,7 @@ Page {
 
             Button {
                 Layout.fillWidth: true
-                visible: !page.wizardMode && page.stored !== null
+                visible: !page.wizardMode && page.profileId !== "chatgpt" && page.stored !== null
                          && page.stored.configured === true
                          && page.activeProfile !== page.profileId
                 enabled: !page.working
