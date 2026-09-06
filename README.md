@@ -242,3 +242,20 @@ artwork owned by the project.
 External contributions are not being accepted yet while the contribution
 policy (CLA) is finalized — bug reports and security reports are very
 welcome.
+
+## ChatGPT subscription (private preview)
+
+With a compatible CLI, Provider & model offers **ChatGPT subscription** separately
+from **OpenAI API**. Open the subscription page to sign in using a device code,
+verify the model, select the provider, or sign out locally. Stop the background
+service before selecting a new active provider; restart it after saving. Existing
+model/effort choices are retained on re-login.
+
+Quick Setup offers the same subscription page before scanning the remaining
+keys. Selecting ChatGPT removes the need for an OpenCode key. OpenAI API keys
+for web research, voice and images remain separate, and those tools can incur API
+charges. Subscription quota currently displays as unknown. Older CLI versions
+without the advertised capability keep the existing onboarding flow.
+
+This UI needs the matching private CLI candidate. Real Pixel sign-in and service
+handoff testing remain required before release.

@@ -193,6 +193,7 @@ MainView {
 
     // setup-api verbs (requests built by pages; secrets stay in-process
     // between the text field and the child's stdin).
+    function apiSubscription(request, cb) { pyCall("setup_api", ["subscription", request], cb); }
     function apiProbe(request, cb)   { pyCall("setup_api", ["probe", request], cb); }
     function apiApply(request, cb)   { pyCall("setup_api", ["apply", request], cb); }
     function apiService(request, cb) { pyCall("setup_api", ["service", request], cb); }

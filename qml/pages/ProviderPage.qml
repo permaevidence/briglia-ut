@@ -21,7 +21,9 @@ Page {
                                             ? app.api.providers.active : ""
     readonly property var catalog: app.api && app.api.opencode_catalog ? app.api.opencode_catalog : []
 
-    property var profileIds: ["opencode", "openrouter", "custom", "local"]
+    property var profileIds: app.api && app.api.subscription_setup && app.api.subscription_setup.supported === true
+                             ? ["opencode", "openrouter", "custom", "local", "openai", "chatgpt"]
+                             : ["opencode", "openrouter", "custom", "local"]
     readonly property string profileId: profileIds[profileSelector.selectedIndex]
     readonly property var stored: profiles && profiles[profileId] ? profiles[profileId] : null
 
@@ -69,6 +71,7 @@ Page {
     // done(ok) is optional — the wizard's Continue auto-commit uses it so a
     // key scanned AFTER the first successful save can't die with the wizard.
     function save(done) {
+        if (profileId === "chatgpt") { app.pushPage("SubscriptionPage.qml", {}); if (done) done(false); return; }
         resultText = ""; resultIsError = false;
         var model = profileId === "opencode" && catalog.length > 0
                     ? catalog[modelSelector.selectedIndex].id : modelField.text.trim();
@@ -260,8 +263,7 @@ Page {
             OptionSelector {
                 id: profileSelector
                 Layout.fillWidth: true
-                model: [i18n.tr("OpenCode (recommended)"), i18n.tr("OpenRouter"),
-                        i18n.tr("Custom endpoint"), i18n.tr("Local server")]
+                model: page.profileIds.map(function(id) { return id === "chatgpt" ? i18n.tr("ChatGPT subscription") : id === "openai" ? i18n.tr("OpenAI API (separate billing)") : id === "opencode" ? i18n.tr("OpenCode (recommended)") : id === "openrouter" ? "OpenRouter" : id === "custom" ? i18n.tr("Custom endpoint") : i18n.tr("Local server"); })
                 selectedIndex: {
                     var start = page.activeProfile !== "" ? page.profileIds.indexOf(page.activeProfile) : 0;
                     return start >= 0 ? start : 0;
@@ -290,6 +292,13 @@ Page {
                     }
                     return bits.length ? i18n.tr("Saved: ") + bits.join(" · ") : "";
                 }
+            }
+
+            Button {
+                Layout.fillWidth: true
+                visible: page.profileId === "chatgpt"
+                text: i18n.tr("Sign in and configure ChatGPT")
+                onClicked: page.app.pushPage("SubscriptionPage.qml", {})
             }
 
             // ---- endpoint (custom / local)
@@ -323,7 +332,7 @@ Page {
             TextField {
                 id: modelField
                 Layout.fillWidth: true
-                visible: page.profileId !== "opencode" || page.catalog.length === 0
+                visible: page.profileId !== "chatgpt" && (page.profileId !== "opencode" || page.catalog.length === 0)
                 inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
                 placeholderText: page.stored && page.stored.model
                                  ? i18n.tr("Model — blank keeps %1").arg(page.stored.model)
@@ -335,7 +344,7 @@ Page {
             // ---- key
             RowLayout {
                 Layout.fillWidth: true
-                visible: page.profileId !== "local"
+                visible: page.profileId !== "local" && page.profileId !== "chatgpt"
                 TextField {
                     id: keyField
                     Layout.fillWidth: true
@@ -364,7 +373,7 @@ Page {
             // ---- vision + effort
             RowLayout {
                 Layout.fillWidth: true
-                visible: page.profileId !== "opencode"
+                visible: page.profileId !== "opencode" && page.profileId !== "chatgpt"
                 Label {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
@@ -385,7 +394,7 @@ Page {
             OptionSelector {
                 id: effortSelector
                 Layout.fillWidth: true
-                visible: page.profileId !== "local"
+                visible: page.profileId !== "local" && page.profileId !== "chatgpt"
                 model: page.effortValues
                 selectedIndex: {
                     var wanted = page.stored && page.stored.effort ? page.stored.effort : "high";
@@ -427,6 +436,7 @@ Page {
                 Layout.fillWidth: true
                 enabled: !page.working
                 color: theme.palette.normal.positive
+                visible: page.profileId !== "chatgpt"
                 text: i18n.tr("Verify & save")
                 onClicked: page.save()
             }
@@ -450,7 +460,7 @@ Page {
             Button {
                 Layout.fillWidth: true
                 visible: page.wizardMode
-                enabled: page.savedOnce && !page.working
+                enabled: (page.savedOnce || (page.profileId === "chatgpt" && page.stored && page.stored.configured === true)) && !page.working
                 color: theme.palette.normal.positive
                 text: keyField.text.trim() !== "" ? i18n.tr("Verify, save & continue")
                                                   : i18n.tr("Continue")

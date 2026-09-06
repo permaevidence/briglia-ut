@@ -48,6 +48,8 @@ Page {
     readonly property bool telegramConfigured: app.api && app.api.telegram
                                                && app.api.telegram.configured === true
 
+    property bool useSubscription: app.api && app.api.providers && app.api.providers.active === "chatgpt"
+
     // "intro" (name + scan) → "run" (rows) → "done" (navigating away)
     property string phase: "intro"
     property bool running: false
@@ -260,6 +262,12 @@ Page {
         };
         switch (sid) {
         case "main":
+            if (useSubscription) {
+                if (app.api && app.api.providers && app.api.providers.active === "chatgpt" && app.api.providers.profiles.chatgpt && app.api.providers.profiles.chatgpt.configured === true) {
+                    setRow(sid, "verified", i18n.tr("keeping ChatGPT subscription")); done(true);
+                } else { setRow(sid, "failed", i18n.tr("Sign in and select ChatGPT before continuing.")); done(false); }
+                return;
+            }
             if (!has("opencode")) {
                 if (providerConfigured) {
                     setRow(sid, "verified", i18n.tr("keeping the current provider"));
@@ -344,7 +352,7 @@ Page {
     // one row and a Retry re-sends only what is still unsaved.
     function buildApply() {
         var req = {};
-        if (rowState("main") !== "ok" && has("opencode")) {
+        if (!useSubscription && rowState("main") !== "ok" && has("opencode")) {
             var model = app.api.opencode_default_model
                         || (app.api.opencode_catalog && app.api.opencode_catalog.length > 0
                             ? app.api.opencode_catalog[0].id : "");
@@ -825,6 +833,25 @@ Page {
                 color: theme.palette.normal.backgroundSecondaryText
                 text: i18n.tr("On your computer, open %1/qr and paste your keys: OpenCode Go, OpenAI, Serper, Jina, a Telegram bot token and your chat ID. AgentMail (an email address for Briglia) and OpenRouter (an alternative provider) are optional and switch on by themselves if present. Then scan the codes with this phone — everything is checked and saved in one go, and Briglia installs its background service, keep-awake and media toolchain. Your device passcode is asked once.")
                       .arg(page.app.websiteBase.replace("https://", ""))
+            }
+            OptionSelector {
+                Layout.fillWidth: true
+                visible: page.phase === "intro" && page.app.api && page.app.api.subscription_setup && page.app.api.subscription_setup.supported === true
+                model: [i18n.tr("OpenCode Go"), i18n.tr("ChatGPT subscription")]
+                selectedIndex: page.useSubscription ? 1 : 0
+                onSelectedIndexChanged: page.useSubscription = selectedIndex === 1
+            }
+            Button {
+                Layout.fillWidth: true
+                visible: page.phase === "intro" && page.useSubscription
+                text: i18n.tr("Sign in and select ChatGPT")
+                onClicked: page.app.pushPage("SubscriptionPage.qml", {})
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: page.phase === "intro" && page.useSubscription
+                wrapMode: Text.WordWrap
+                text: i18n.tr("No OpenCode key is needed. Sign in above first, then scan your tool and Telegram keys below. The OpenAI API key remains separate for web, voice and images.")
             }
             TextField {
                 id: nameField
