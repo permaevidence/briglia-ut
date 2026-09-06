@@ -12,6 +12,7 @@ Page {
     property string loginCode: ""
     property string message: ""
     property bool signedIn: false
+    property int retryableFailures: 0
     header: PageHeader { title: i18n.tr("ChatGPT subscription") }
 
     function call(request, done) {
@@ -22,12 +23,21 @@ Page {
             if (!r || r.ok !== true) {
                 var failure = page.app.describeError(r);
                 page.message = failure;
+                if (request.action === "poll" && page.pending === request.pending
+                        && r && r.error && r.error.retryable === true
+                        && page.retryableFailures < 6) {
+                    page.retryableFailures += 1;
+                    poll.interval = Math.max(1000, Math.min(30000, poll.interval || 5000));
+                    poll.start();
+                    return;
+                }
                 if (request.action === "poll" || request.action === "cancel") {
                     poll.stop(); page.pending = ""; page.loginCode = "";
                     page.status(failure);
                 }
                 return;
             }
+            if (request.action === "poll") page.retryableFailures = 0;
             done(r);
         });
     }
@@ -42,6 +52,7 @@ Page {
     }
     function start() {
         poll.stop();
+        retryableFailures = 0;
         call({action: "start"}, function(r) {
             page.pending = r.pending; page.loginCode = r.code;
             page.message = i18n.tr("Open ChatGPT sign-in and enter this code. Expires in 15 minutes.");

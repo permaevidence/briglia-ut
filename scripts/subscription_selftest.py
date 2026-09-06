@@ -20,6 +20,7 @@ const assert = require('assert');
 String.prototype.arg = function(s) { return this.replace('%1', s); };
 const i18n = {tr:s=>s};
 let busy=false, alive=true, pending='', generation='scope-A', loginCode='', message='', signedIn=false;
+let retryableFailures=0;
 let calls=[], response={ok:true}, modelField={text:'gpt-5.6-luna'}, effortField={text:'high'};
 let starts=0, stops=0; let poll={interval:0,start(){starts++},stop(){stops++}};
 let app={apiSubscription(req, cb){calls.push(req);cb(response)},describeError(r){return 'failed'},refresh(){}};
@@ -43,6 +44,23 @@ for (const action of ['poll','cancel']) {
   app.apiSubscription=(r, cb)=>{ calls.push(r); cb({ok:true,pending:'new',code:'NEW',interval:1}); };
   start(); assert.equal(pending,'new'); assert.equal(loginCode,'NEW');
 }
+// A transient poll failure preserves the already approved code and retries;
+// success resets the budget, while a bounded run of failures permits recovery.
+pending='approved-handle'; loginCode='APPROVED'; calls=[]; poll.interval=5000;
+app.apiSubscription=(r,cb)=>{ calls.push(r); cb({ok:false,error:{retryable:true}}); };
+let retryStarts=starts;
+check(); assert.equal(pending,'approved-handle'); assert.equal(loginCode,'APPROVED');
+assert.equal(starts,retryStarts+1); assert.equal(retryableFailures,1); assert.equal(busy,false);
+assert.deepEqual(calls.map(r=>r.action),['poll']); assert.equal(poll.interval,5000);
+app.apiSubscription=(r,cb)=>{ cb({ok:true,state:'pending',interval:2}); };
+check(); assert.equal(retryableFailures,0); assert.equal(pending,'approved-handle');
+app.apiSubscription=(r,cb)=>{ cb({ok:false,error:{retryable:true}}); };
+for (let i=0;i<6;i++) { check(); assert.equal(pending,'approved-handle'); }
+check(); assert.equal(pending,''); assert.equal(loginCode,''); assert.equal(busy,false);
+app.apiSubscription=(r,cb)=>{ cb({ok:true,pending:'replacement',code:'NEW',interval:1}); };
+start(); assert.equal(retryableFailures,0); assert.equal(pending,'replacement');
+app.apiSubscription=(r,cb)=>{ cb({ok:true,state:'signed_in',generation:'scope-B'}); };
+check(); assert.equal(pending,''); assert.equal(loginCode,''); assert.equal(signedIn,true);
 busy=true; pending='valid'; const before=starts; const beforeCalls=calls.length;
 check(); assert.equal(starts,before+1); assert.equal(calls.length,beforeCalls);
 busy=false; pending=''; check(); assert.equal(starts,before+1);
