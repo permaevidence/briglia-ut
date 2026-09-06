@@ -120,7 +120,7 @@ MIN_APP_SEQUENCE = 2
 # THIS build's own release sequence. publish_click.sh signs exactly this
 # value into the app envelope and refuses to publish anything else; a
 # device records it as its floor once the update lands.
-APP_RELEASE_SEQUENCE = 6
+APP_RELEASE_SEQUENCE = 7
 
 CLI_POLICY = ReleasePolicy(
     "briglia-cli", CLI_KEYS,

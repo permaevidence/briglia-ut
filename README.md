@@ -12,6 +12,15 @@ and the companion-app chat socket); the installer refuses anything else by
 design, and a phone whose CLI still answers schema 1 is told to update the
 CLI rather than shown a half-working app.
 
+Version 0.8.5 adds **ChatGPT subscription** as a separate provider in Setup,
+Quick Setup and Settings when Briglia CLI 0.2.10 or later advertises support.
+Open the supplied verification link, approve the device code, then select the
+model and effort. Retryable connection errors retain the code while the app
+retries; Cancel ends the pending login. OpenAI API keys for web search,
+transcription and image generation remain separate from subscription access.
+The login and recovery flows have automated macOS/Linux coverage; physical Pixel
+onboarding is still awaiting field testing.
+
 ## What it does
 
 - **Install / update the CLI** from the signed GitHub Releases channel:
@@ -22,7 +31,7 @@ CLI rather than shown a half-working app.
   `~/.local/bin`.
 - **Quick setup** (default entry, `qml/pages/QuickSetupPage.qml`): type
   your name, scan the website's `/qr` key bundle once, done. Every scanned
-  key is probed live, everything is saved in ONE `setup-api apply`, then
+  key is probed live, verified settings are saved through `setup-api`, then
   the background service (+ start at boot), the keep-awake unit and the
   full media toolchain (pandoc and LibreOffice included) are installed —
   all mandatory on this path (a missing or unreadable capability fails
