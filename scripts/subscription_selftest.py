@@ -21,7 +21,7 @@ String.prototype.arg = function(s) { return this.replace('%1', s); };
 const i18n = {tr:s=>s};
 let busy=false, alive=true, pending='', generation='scope-A', loginCode='', message='', signedIn=false;
 let calls=[], response={ok:true}, modelField={text:'gpt-5.6-luna'}, effortField={text:'high'};
-let poll={interval:0,start(){},stop(){}};
+let starts=0, stops=0; let poll={interval:0,start(){starts++},stop(){stops++}};
 let app={apiSubscription(req, cb){calls.push(req);cb(response)},describeError(r){return 'failed'},refresh(){}};
 let page = new Proxy({}, {get(_,k) { return eval(k) }, set(_,k,v) { eval(k+'=v'); return true }});
 '''
@@ -32,6 +32,20 @@ assert.equal(calls.length,1); assert.equal(calls[0].action,'probe'); assert.equa
 calls=[]; app.apiSubscription=(r, cb)=>{ calls.push(r);cb({ok:true,generation:'scope-A'}); };
 save(); assert.equal(calls.length,2); assert.deepEqual(calls[1],{action:'select',model:'gpt-5.6-luna',effort:'high',generation:'scope-A',activate:true});
 calls=[]; pending='handle'; cancel(); assert.equal(calls[0].pending,'handle'); assert.equal(calls[0].action,'cancel');
+// Both error handlers release the handle and refresh account state; status
+// failure must not recurse or disable a fresh login.
+for (const action of ['poll','cancel']) {
+  pending='old-handle'; loginCode='OLD'; calls=[];
+  app.apiSubscription=(r, cb)=>{ calls.push(r); cb({ok:false}); };
+  call({action:action,pending:pending},()=>{throw Error('error callback')});
+  assert.equal(pending,''); assert.equal(loginCode,''); assert.equal(busy,false);
+  assert.deepEqual(calls.map(r=>r.action),[action,'status']);
+  app.apiSubscription=(r, cb)=>{ calls.push(r); cb({ok:true,pending:'new',code:'NEW',interval:1}); };
+  start(); assert.equal(pending,'new'); assert.equal(loginCode,'NEW');
+}
+busy=true; pending='valid'; const before=starts; const beforeCalls=calls.length;
+check(); assert.equal(starts,before+1); assert.equal(calls.length,beforeCalls);
+busy=false; pending=''; check(); assert.equal(starts,before+1);
 alive=false; busy=true; call({action:'start'},()=>{throw Error('dead page callback')});
 page=null; call({action:'status'},()=>{throw Error('destroyed page callback')});
 console.log('Subscription QML handlers: failed probe, exact selection, cancellation and destroyed page PASS');
@@ -48,3 +62,26 @@ assert 'ChatGPT subscription' in provider and 'OpenAI API (separate billing)' in
 assert 'subscription_setup.supported === true' in provider
 assert 'visible: !page.wizardMode && page.profileId !== \"chatgpt\"' in provider
 print('Subscription UI capability gating, API/provider separation and Quick Setup integration PASS')
+
+# Run the real API provider save handler, including model-specific Responses
+# verification, and verify hidden scanned keys cannot block subscription setup.
+source = provider
+provider_js = r'''
+const assert = require('assert');
+const i18n={tr:s=>s}; String.prototype.arg=function(s){return this.replace('%1',s)};
+let profileId='openai', catalog=[], wizardMode=true, stored=null, working=false;
+let resultText='', resultIsError=false, keyInjected='old', savedOnce=false;
+let modelField={text:'gpt-5.6-luna'}, keyField={text:'synthetic'}, baseUrlField={text:''};
+let probes=[], applies=[], finished=null, modelSelector={selectedIndex:0};
+let app={scannedKeys:{chatgpt:'forged-key'}, apiProbe(r,cb){probes.push(r);cb({ok:false})}, apiApply(r,cb){applies.push(r)}, describeError(){return 'bad model'}};
+let page={app:app, fail(s){working=false}, buildApply(){return {}}};
+'''
+provider_js += '\n'.join(function(n) for n in ['save','syncScannedKey'])
+provider_js += r'''
+save(ok=>finished=ok);
+assert.deepEqual(probes,[{kind:'responses',api_key:'synthetic',model:'gpt-5.6-luna'}]);
+assert.equal(applies.length,0);assert.equal(finished,false);
+profileId='chatgpt';syncScannedKey();assert.equal(keyField.text,'');assert.equal(keyInjected,'');
+console.log('Provider handlers: Responses model probe, refusal before apply and hidden-key reset PASS');
+'''
+subprocess.run(['node','-e',provider_js],check=True)

@@ -19,15 +19,23 @@ Page {
         app.apiSubscription(request, function(r) {
             if (!page || !page.alive) return;
             page.busy = false;
-            if (!r || r.ok !== true) { page.message = page.app.describeError(r); return; }
+            if (!r || r.ok !== true) {
+                var failure = page.app.describeError(r);
+                page.message = failure;
+                if (request.action === "poll" || request.action === "cancel") {
+                    poll.stop(); page.pending = ""; page.loginCode = "";
+                    page.status(failure);
+                }
+                return;
+            }
             done(r);
         });
     }
-    function status() {
+    function status(failure) {
         call({action: "status"}, function(r) {
             page.signedIn = r.state === "signed_in";
             page.generation = r.generation || "";
-            page.message = page.signedIn ? i18n.tr("Signed in. Verify your chosen model, then save.") : i18n.tr("Sign in to continue. Enable device login in ChatGPT security settings if needed.");
+            page.message = failure || (page.signedIn ? i18n.tr("Signed in. Verify your chosen model, then save.") : i18n.tr("Sign in to continue. Enable device login in ChatGPT security settings if needed."));
             if (!modelField.text) modelField.text = r.model || "gpt-5.6-luna";
             if (!effortField.text) effortField.text = r.effort || "high";
         });
@@ -42,7 +50,8 @@ Page {
     }
     function check() {
         var id = pending;
-        if (!id || busy) return;
+        if (!id) return;
+        if (busy) { poll.start(); return; }
         call({action: "poll", pending: id}, function(r) {
             if (page.pending !== id) return;
             if (r.state === "signed_in") { page.pending = ""; page.loginCode = ""; page.status(); }

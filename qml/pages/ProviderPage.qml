@@ -101,7 +101,8 @@ Page {
             probeRequest = {kind: "local", base_url: baseUrlField.text.trim()
                             || (stored && stored.endpoint ? stored.endpoint : ""), model: model};
         } else if (newKey !== "") {
-            probeRequest = {kind: profileId, api_key: newKey};
+            probeRequest = {kind: profileId === "openai" ? "responses" : profileId, api_key: newKey};
+            if (profileId === "openai") probeRequest.model = model;
             if (profileId === "openrouter") probeRequest.model = model;
             if (profileId === "custom") {
                 probeRequest.base_url = baseUrlField.text.trim()
@@ -150,6 +151,7 @@ Page {
     property string keyInjected: ""
 
     function syncScannedKey() {
+        if (profileId === "chatgpt") { keyField.text = ""; keyInjected = ""; return; }
         var r = ScanLogic.sync(keyField.text, keyInjected,
                                app.scannedKeys ? app.scannedKeys[profileId] : "");
         if (keyField.text !== r.text) keyField.text = r.text;
@@ -467,7 +469,7 @@ Page {
                 onClicked: {
                     // A key left in the field (scanned after the first save)
                     // must not die with the wizard — commit it first.
-                    if (keyField.text.trim() !== "")
+                    if (page.profileId !== "chatgpt" && keyField.text.trim() !== "")
                         page.save(function(ok) { if (ok) page.app.wizardNext(); });
                     else
                         page.app.wizardNext();
