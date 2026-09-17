@@ -158,13 +158,13 @@ class WatchError(Exception):
     pass
 
 
-def gh_json(cfg, path, params=None):
+def gh_json(cfg, path, params=None, max_bytes=MAX_SMALL_FETCH):
     url = cfg["github_api"] + path + ("?" + urllib.parse.urlencode(params) if params else "")
     headers = {"Accept": "application/vnd.github+json"}
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = "Bearer " + token
-    status, _, body = fetch(url, headers=headers)
+    status, _, body = fetch(url, max_bytes=max_bytes, headers=headers)
     if status != 200:
         raise WatchError("GitHub API %s → HTTP %s" % (path, status))
     try:
@@ -667,7 +667,10 @@ def check_channel(cfg, channel, run, now):
 
     # 3b. latest pointer confusion: no non-draft release may out-version latest
     try:
-        releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": 100})
+        # The full release list grows ~22 KB per release (three platforms of
+        # assets each); it passed 512 KiB at 29 releases. Allow the page cap.
+        releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": 100},
+                           max_bytes=MAX_PAGE_FETCH)
     except WatchError as exc:
         run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc)
         releases = []
