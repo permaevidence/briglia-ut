@@ -99,6 +99,7 @@ USER_AGENT = "briglia-release-watch/" + WATCH_VERSION
 MAX_SMALL_FETCH = 512 * 1024          # envelopes, installers, API JSON, pages
 MAX_PAGE_FETCH = 4 * 1024 * 1024
 FULL_HASH_INTERVAL = 24 * 3600
+RELEASE_PAGE_SIZE = 100               # one page of /releases; a full page is reported as incomplete
 
 # Every channel entry carries an explicit `kind` (cli | app). The kind — not
 # the channel NAME — selects the verification policy and the corroboration
@@ -702,6 +703,34 @@ def corroborate_app(cfg, chan, run, record):
     return ("publication log disagrees with the live release: " + ", ".join(problems)) if problems else None
 
 
+def check_website_installers(run, channel, chan, released):
+    """Every website install URL is probed independently: a failure on one
+    host never skips another host, nor discards a mismatch already found on
+    another. All problems go into ONE `website-installer` finding, which is
+    network-class (grace period) only when EVERY problem is a network
+    failure — a confirmed wrong answer from any host alerts at once."""
+    try:
+        site_urls = url_list(chan.get("website_install_url"))
+    except WatchError as exc:
+        run.alert(channel + "/config-invalid", str(exc))
+        return
+    site_bad, site_net = [], True
+    for site_url in site_urls:
+        try:
+            s3, _, via_site = fetch(site_url)
+        except Exception as exc:  # noqa: BLE001 — record, then check the next host
+            site_bad.append("%s: fetch failed: %s" % (site_url, exc))
+            site_net = site_net and is_network_error(exc)
+            continue
+        if s3 != 200 or via_site != released:
+            site_bad.append("%s does not resolve to the released installer (HTTP %s)" % (site_url, s3))
+            site_net = False
+        else:
+            run.ok("website install URL %s resolves to the released installer" % site_url)
+    if site_bad:
+        run.alert(channel + "/website-installer", "; ".join(site_bad), transient=site_net)
+
+
 def check_channel(cfg, channel, run, now):
     chan = cfg["channels"][channel]
     repo = chan["repo"]
@@ -785,7 +814,7 @@ def check_channel(cfg, channel, run, now):
     try:
         # The full release list grows ~22 KB per release (three platforms of
         # assets each); it passed 512 KiB at 29 releases. Allow the page cap.
-        releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": 100},
+        releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": RELEASE_PAGE_SIZE},
                            max_bytes=MAX_PAGE_FETCH)
     except WatchError as exc:
         run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc,
@@ -814,7 +843,12 @@ def check_channel(cfg, channel, run, now):
     if mutable:
         run.alert(channel + "/release-not-immutable",
                   "published release(s) that are NOT immutable: %s" % ", ".join(sorted(mutable)))
-    if releases and not bad_tags and not mutable:
+    if len(releases) >= RELEASE_PAGE_SIZE:
+        # Only the first page is read: say so instead of claiming "all".
+        run.alert(channel + "/release-list-incomplete",
+                  "the release list filled one page (%d); releases beyond it are NOT checked for tag shape, "
+                  "immutability or out-versioning latest — add pagination" % len(releases))
+    elif releases and not bad_tags and not mutable:
         run.ok("all %d published release(s) are immutable with v<semver> tags" % len(published))
 
     # 4. assets: probe hourly, full hash daily / after change
@@ -866,16 +900,7 @@ def check_channel(cfg, channel, run, now):
                           "released %s differs from %s at %s" % (chan["installer_asset"], chan["installer_source"], tag))
             else:
                 run.ok("released installer is byte-identical to %s@%s" % (chan["installer_source"], tag))
-                site_bad = []
-                for site_url in url_list(chan.get("website_install_url")):
-                    s3, _, via_site = fetch(site_url)
-                    if s3 != 200 or via_site != released:
-                        site_bad.append("%s (HTTP %s)" % (site_url, s3))
-                    else:
-                        run.ok("website install URL %s resolves to the released installer" % site_url)
-                if site_bad:
-                    run.alert(channel + "/website-installer",
-                              "does not resolve to the released installer: " + "; ".join(site_bad))
+                check_website_installers(run, channel, chan, released)
         except Exception as exc:  # noqa: BLE001
             run.alert(channel + "/installer", "installer check failed: %s" % exc,
                       transient=is_network_error(exc))

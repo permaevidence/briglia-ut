@@ -56,6 +56,7 @@ class Fake:
         self.domain_page = None        # bytes served by /domain/app (None → same as the site)
         self.legacy_manifest = None
         self.telegram = []         # captured message texts
+        self.hits = []             # every GET path, in order
         self.faults = {}           # range_total: int | None; asset_404: name; asset_sub: {name: bytes};
         #                          api_status: int; tg_status: int; ref_status: int
         fake = self
@@ -93,6 +94,11 @@ class Fake:
             def do_GET(self):
                 u = urllib.parse.urlparse(self.path)
                 p, q = u.path, urllib.parse.parse_qs(u.query)
+                fake.hits.append(p)
+                if p == fake.faults.get("disconnect_path"):   # connection dropped without an answer
+                    self.connection.shutdown(2)
+                    self.connection.close()
+                    return
                 m = re.match(r"^/latest/([^/]+)/manifest\.sig\.json$", p)
                 if m:
                     env = fake.envelopes.get(m.group(1))
@@ -438,6 +444,14 @@ def main():
               rc == 0 and not any("release-bad-tag" in m or "release-not-immutable" in m for m in fake.telegram)
               and any("draft release(s) present: scratch" in m for m in fake.telegram), fake.telegram)
         fake.releases["test/briglia-cli"].pop(0); run(); fake.telegram.clear()
+        filler = [{"id": 10 + i, "tag_name": "v0.0.%d" % i, "draft": False, "immutable": True}
+                  for i in range(100 - len(fake.releases["test/briglia-cli"]))]
+        fake.releases["test/briglia-cli"][0:0] = filler
+        rc, out = run()
+        check("a FULL first page of releases → release-list-incomplete alert, never 'all … releases' claimed",
+              rc == 2 and any("release-list-incomplete" in m for m in fake.telegram)
+              and "published release(s) are immutable" not in out.split("— briglia-ut")[0], fake.telegram)
+        del fake.releases["test/briglia-cli"][0:len(filler)]; run(); fake.telegram.clear()
         fake.faults["api_status"] = 503
         # network-class: retried in-run and announced only after
         # transient_grace_checks (default 3) consecutive failing checks
@@ -502,6 +516,32 @@ def main():
         check("both hostnames stale at once (the ISR-lag case) → ONE website-page message, not one per hostname",
               rc == 2 and sum("website-page" in m for m in fake.telegram) == 1, fake.telegram)
         fake.site_page = good_page; run(); fake.telegram.clear()
+        # Codex round 1: one host's connection failure must neither skip the
+        # other host nor discard a mismatch already found on it.
+        alias, domain = "/site/cli/install.sh", "/domain/cli/install.sh"
+        fake.faults["disconnect_path"] = alias
+        fake.domain_installer = b"#!/bin/bash\necho malicious real domain\n"
+        fake.hits.clear(); rc, out = run()
+        check("alias connection dropped + real-domain bytes wrong → BOTH hosts fetched, website-installer alert on the FIRST check",
+              rc == 2 and alias in fake.hits and domain in fake.hits
+              and any("website-installer" in m and domain + " does not resolve" in m for m in fake.telegram), fake.telegram)
+        del fake.faults["disconnect_path"]; fake.domain_installer = None; run(); fake.telegram.clear()
+        fake.site_installer = b"#!/bin/bash\necho malicious alias\n"
+        fake.faults["disconnect_path"] = domain
+        fake.hits.clear(); rc, out = run()
+        check("alias bytes wrong + real-domain connection dropped → BOTH hosts fetched, mismatch kept, alert on the FIRST check",
+              rc == 2 and alias in fake.hits and domain in fake.hits
+              and any("website-installer" in m and alias + " does not resolve" in m for m in fake.telegram), fake.telegram)
+        del fake.faults["disconnect_path"]; fake.site_installer = None; run(); fake.telegram.clear()
+        fake.site_installer = b"#!/bin/bash\necho malicious alias\n"
+        rc, out = run()
+        n = len(fake.telegram)
+        fake.site_installer = None
+        fake.faults["disconnect_path"] = alias       # recovery NOT established: the alias cannot be read
+        rc, out = run()
+        check("a known website-installer mismatch whose host then stops answering → NO false recovery message",
+              n >= 1 and rc == 2 and not any("recovered" in m and "website-installer" in m for m in fake.telegram[n:]), fake.telegram)
+        del fake.faults["disconnect_path"]; run(); fake.telegram.clear()
         fake.legacy_manifest = {"version": "0.7.3", "sha256": "00" * 32}
         rc, out = run()
         check("legacy Blob manifest disagreeing with the authoritative release → legacy-blob alert",
