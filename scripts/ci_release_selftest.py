@@ -149,7 +149,8 @@ def quiesce_tests(root):
     import http.server
     import threading
     import urllib.parse
-    st = {"var": "false", "runs": {}, "jobs": {}, "releases": [], "cancels": [], "deletes": [], "lie_total": False}
+    st = {"var": "false", "runs": {}, "jobs": {}, "releases": [], "cancels": [], "deletes": [], "lie_total": False,
+          "jobs_broken": set()}
 
     class H(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -174,11 +175,14 @@ def quiesce_tests(root):
             m = re.search(r"/actions/workflows/9/runs$", u.path)
             if m:
                 want = q.get("status", [None])[0]
-                runs = [r for r in st["runs"].values() if r["status"] == want]
+                runs = [r for r in sorted(st["runs"].values(), key=lambda r: r.get("id", 0))
+                        if want is None or r.get("status") == want]
                 chunk = runs[(page - 1) * 100:page * 100]
                 return self._j(200, {"total_count": len(runs) + (1 if st["lie_total"] and runs else 0), "workflow_runs": chunk})
             m = re.search(r"/actions/runs/(\d+)/jobs$", u.path)
             if m:
+                if int(m.group(1)) in st["jobs_broken"]:
+                    return self._j(502, {})
                 jobs = st["jobs"].get(int(m.group(1)), [])
                 return self._j(200, {"total_count": len(jobs), "jobs": jobs if page == 1 else []})
             m = re.search(r"/actions/runs/(\d+)$", u.path)
@@ -254,7 +258,66 @@ def quiesce_tests(root):
         st["jobs"][13] = [{"status": "completed"}]
         st["releases"] = [{"id": 601, "tag_name": "v0.8.9", "draft": False}]
         rc, out = q()
-        check("no run outstanding; a touched tag already PUBLISHED is reported as the live release", rc == 0, out)
+        check("no run outstanding; a touched tag already PUBLISHED is reported as the live release (message shown), exit 0",
+              rc == 0 and "v0.8.9 is PUBLISHED" in out and "CI is quiet" in out, out)
+
+        # Codex 2026-10-05 reproduction, ALONE (no unrelated waiting run to
+        # mask it): a FRESH invocation finds the only run already reporting
+        # completed/cancelled while its publisher job is still running.
+        st.update(runs={12: {"id": 12, "head_branch": "v0.8.8", "status": "completed", "conclusion": "cancelled",
+                             "html_url": "u12"}},
+                  jobs={12: [{"id": 120, "name": "Publish immutable release", "status": "in_progress"}]},
+                  releases=[], cancels=[])
+        rc, out = q()
+        check("Codex repro: completed/cancelled run whose publisher job is still in progress → refuses, NOT 'CI is quiet'",
+              rc != 0 and "CI is quiet" not in out and "12" in out and "still not terminal" in out, out)
+        rc, out = q("--cancel")
+        check("…--cancel sends no cancel request for a run that already reports completed, still refuses",
+              rc != 0 and st["cancels"] == [] and "CI is quiet" not in out, out)
+        st["jobs"][12] = [{"id": 120, "name": "Publish immutable release", "status": "completed"}]
+        rc, out = q()
+        check("…once the publisher job completes → CI quiet, exit 0", rc == 0 and "CI is quiet" in out, out)
+
+        st["jobs"][12] = [{"id": 120, "name": "Publish immutable release", "status": "in_progress"}]
+        flips = {"n": 0}
+        orig_jobs = st["jobs"]
+
+        class Later(dict):   # the job finishes after a few polls
+            def get(self, k, d=None):
+                if k == 12:
+                    flips["n"] += 1
+                    if flips["n"] >= 3:
+                        return [{"id": 120, "name": "Publish immutable release", "status": "completed"}]
+                return dict.get(self, k, d)
+        st["jobs"] = Later(orig_jobs)
+        rc, out = q("--wait")
+        check("…--wait polls the completed run's jobs until the publisher stops, then CI quiet",
+              rc == 0 and flips["n"] >= 3 and "conclusively terminal" in out and "CI is quiet" in out, out)
+        st["jobs"] = dict(orig_jobs)
+        st["jobs"][12] = [{"id": 120, "status": "completed"}]
+
+        st["runs"][7] = {"id": 7, "head_branch": "v0.8.6", "status": "completed", "conclusion": "success", "html_url": "u7"}
+        st["jobs"][7] = [{"id": 70, "status": "completed"}]
+        st["runs"][7].update(status="queued", conclusion=None)   # an OLD run re-run
+        rc, out = q()
+        check("an old run that was re-run (no longer completed) → refuses", rc != 0 and "still not terminal" in out
+              and "CI is quiet" not in out, out)
+        st["runs"][7].update(status="completed", conclusion="success")
+        st["jobs_broken"] = {7}
+        rc, out = q()
+        check("a run's job list cannot be read (HTTP 502) → refuses (missing evidence is never 'quiet')",
+              rc != 0 and "CI is quiet" not in out and "HTTP 502" in out, out)
+        st["jobs_broken"] = set()
+        st["jobs"][7] = [{"id": 70}]
+        rc, out = q()
+        check("a job record without a status → refuses", rc != 0 and "no status" in out and "CI is quiet" not in out, out)
+        st["jobs"][7] = [{"id": 70, "status": "completed"}]
+        st["runs"][99] = {"head_branch": "v0.9.0", "status": "completed"}
+        rc, out = q()
+        check("a run record without an id → refuses", rc != 0 and "no id/status" in out and "CI is quiet" not in out, out)
+        del st["runs"][99]
+        rc, out = q()
+        check("…evidence complete again → CI quiet, exit 0", rc == 0 and "CI is quiet" in out, out)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -291,6 +354,70 @@ def restore_check_tests(root):
     check("right passphrase but a different expected key → NO MATCH", rc != 0 and "UT key: NO MATCH" in out, out)
     rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n", UT_SUFFIX="0000000000000000")
     check("backup missing on the stick → NO MATCH", rc != 0 and "UT key: NO MATCH" in out, out)
+    # Codex 2026-10-05 reproduction: a malformed expected key COMBINED with
+    # backups that do not decrypt (wrong passphrase / not a key at all) —
+    # both conversions fail; the old check hashed two empty outputs and
+    # reported MATCH. Separate stick, entirely fake inputs.
+    bad = os.path.join(root, "usb-bad")
+    os.makedirs(bad)
+    junk_pub = os.path.join(bad, "invalid.pub")
+    open(junk_pub, "w").write("not a public key\n")
+    for suffix in ("clijunk", "utjunk"):
+        open(os.path.join(bad, "test-release-v1-%s.priv.pem.enc" % suffix), "wb").write(b"not an encrypted key")
+
+    def rc_bad(stdin, **over):
+        e = dict(os.environ, EXPECTED_CLI_PUB=junk_pub, EXPECTED_UT_PUB=junk_pub, CLI_SUFFIX="clijunk", UT_SUFFIX="utjunk")
+        e.update(over)
+        p = subprocess.run([os.path.join(REL, "restore-check.sh"), bad], input=stdin, capture_output=True, text=True, env=e)
+        return p.returncode, p.stdout, p.stderr
+    rc, out, err = rc_bad("wrong\nwrong\n")
+    check("Codex repro: malformed expected key + undecryptable backups + wrong passphrases → both NO MATCH, exit ≠ 0",
+          rc != 0 and "CLI key: NO MATCH" in out and "UT key: NO MATCH" in out and ": MATCH" not in out
+          and "both backups restore" not in out and "do NOT delete" in out, out + err)
+    check("…the expected key is named as not a valid Ed25519 public key", out.count("not a valid Ed25519 public key") == 2, out)
+    rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n", EXPECTED_CLI_PUB=junk_pub, EXPECTED_UT_PUB=junk_pub)
+    check("malformed expected key even with the RIGHT backups and passphrases → NO MATCH",
+          rc != 0 and "CLI key: NO MATCH" in out and "UT key: NO MATCH" in out, out)
+    rc, out, err = rc_bad("wrong\nwrong\n", EXPECTED_CLI_PUB=keys["cli"].pub, EXPECTED_UT_PUB=keys["ut"].pub)
+    check("valid expected keys, garbage backups → NO MATCH, named as 'did not decrypt'",
+          rc != 0 and out.count("did not decrypt") == 2 and ": MATCH" not in out, out)
+    empty_pub = os.path.join(bad, "empty.pub")
+    open(empty_pub, "w").close()
+    rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n", EXPECTED_UT_PUB=empty_pub)
+    check("empty expected key file → UT NO MATCH (CLI still MATCH)", rc != 0 and "UT key: NO MATCH" in out
+          and "CLI key: MATCH" in out, out)
+    ec_pub = os.path.join(bad, "p256.pub")
+    ec_priv = os.path.join(bad, "p256.pem")
+    subprocess.run([openssl, "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", ec_priv],
+                   check=True, capture_output=True)
+    subprocess.run([openssl, "pkey", "-in", ec_priv, "-pubout", "-out", ec_pub], check=True, capture_output=True)
+    os.unlink(ec_priv)
+    rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n", EXPECTED_UT_PUB=ec_pub)
+    check("a valid but NON-Ed25519 expected key → NO MATCH", rc != 0 and "UT key: NO MATCH" in out
+          and "not a valid Ed25519" in out, out)
+    empty_dir = os.path.join(root, "usb-empty-backup")
+    os.makedirs(empty_dir)
+    for k in ("cli", "ut"):
+        open(os.path.join(empty_dir, keys[k].key_id.replace("briglia-", "ada-") + ".priv.pem.enc"), "wb").close()
+    p = subprocess.run([os.path.join(REL, "restore-check.sh"), empty_dir], input="correct horse cli\ncorrect horse ut\n",
+                       capture_output=True, text=True, env=dict(os.environ, **env))
+    check("empty backup files → NO MATCH", p.returncode != 0 and p.stdout.count("NO MATCH") == 2, p.stdout)
+    rc, out, err = rc_run("")
+    check("no passphrase at all (stdin closed) → NO MATCH, exit ≠ 0", rc != 0 and ": MATCH" not in out
+          and out.count("no passphrase") == 2, out)
+    rc, out, err = rc_run("correct horse cli\n")
+    check("UT passphrase missing (stdin ends after the CLI one) → CLI MATCH, UT NO MATCH",
+          rc != 0 and "CLI key: MATCH" in out and "UT key: NO MATCH" in out, out)
+    if os.geteuid() != 0:
+        os.chmod(keys["ut"].pub, 0)
+        try:
+            rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n")
+        finally:
+            os.chmod(keys["ut"].pub, 0o644)
+        check("unreadable expected key → NO MATCH", rc != 0 and "UT key: NO MATCH" in out and "unreadable" in out, out)
+    rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n")
+    check("control: the working keys still MATCH after all of the above", rc == 0 and "CLI key: MATCH" in out
+          and "UT key: MATCH" in out, out + err)
     check("nothing was written next to the backups", sorted(os.listdir(d)) == before, os.listdir(d))
 
 
