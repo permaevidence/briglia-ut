@@ -32,7 +32,9 @@ Per channel, `check`:
      name) for this tag at the recorded commit, completed/success, every
      configured required job successful (a skipped required job fails);
      above the channel's `approval_required_above_sequence` cutoff, the
-     signing job executed exactly once (run attempt 1) and the run's review
+     signing job executed exactly once (run attempt 1 — a publish-only
+     "re-run failed jobs" attempt lists it again as a carried copy with the
+     same start/end/runner, which is the same execution) and the run's review
      history holds exactly one approval for the signing environment's id,
      by the configured reviewer's stable user id, and no rejection — any
      error, missing field or ambiguity is "approval unverified", never
@@ -774,14 +776,27 @@ def corroborate_signed_run(cfg, chan, run, record, require_approval):
 
     # --- approval bound to the single signing execution
     sign_name = chan.get("signing_job") or ""
-    signs = {}
+    # A "Re-run failed jobs" attempt lists every job it did NOT re-run as a
+    # carried copy: a NEW job id with the new run_attempt, but the original
+    # execution's started_at, completed_at and runner (observed in the
+    # rehearsal, 2026-10-05). One EXECUTION is therefore keyed by those three
+    # fields; a record lacking any of them counts as its own execution
+    # (conservative). The execution's earliest record carries its real attempt.
+    executions = {}
     for j in jobs:
-        if j.get("name") == sign_name:
-            signs[_int(j.get("id"))] = j
-    if None in signs or len(signs) != 1:
+        if j.get("name") != sign_name:
+            continue
+        key = (j.get("started_at"), j.get("completed_at"), j.get("runner_name"))
+        if not all(isinstance(k, str) and k for k in key):
+            key = ("job-id", _int(j.get("id")), id(j))
+        executions.setdefault(key, []).append(j)
+    if len(executions) != 1:
         return ("approval unverified: %d signing execution(s) of '%s' in run %s — one approval cannot be bound "
-                "to more than one signing attempt" % (len(signs), sign_name, rid))
-    sign = next(iter(signs.values()))
+                "to more than one signing attempt" % (len(executions), sign_name, rid))
+    records = next(iter(executions.values()))
+    sign = min(records, key=lambda j: (_int(j.get("run_attempt")) or 0, _int(j.get("id")) or 0))
+    if any(r.get("conclusion") != sign.get("conclusion") for r in records):
+        return "approval unverified: copies of the signing job disagree on its conclusion"
     if _int(sign.get("run_attempt")) != 1 or sign.get("conclusion") != "success":
         return ("approval unverified: the signing job ran in attempt %r (%s) — only a successful attempt-1 "
                 "signing is bound to the run's approval" % (sign.get("run_attempt"), sign.get("conclusion")))

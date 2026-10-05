@@ -230,9 +230,9 @@ def stamp_app_policy(source, key_id, pub_hex, releases_base=None, sequence=None)
     """Return py/release_verify.py text with the APP key replaced by a test
     key and (optionally) the app channel's release location moved from the
     production repository to `releases_base` (…/releases) and the build's
-    own APP_RELEASE_SEQUENCE set. The same edit the rehearsal-stamping
-    commit makes (scripts/rehearsal/stamp.py); production files are never
-    touched by it."""
+    own APP_RELEASE_SEQUENCE set. The rehearsal-stamping commit (scratch
+    only, never on main or the public repo) applies this same function;
+    production files are never touched by it."""
     import re
     s = re.sub(r"# STAMP-APP-KEY-BEGIN.*?# STAMP-APP-KEY-END",
                '# STAMP-APP-KEY-BEGIN\nAPP_KEYS = {\n    "%s":\n        "%s",\n}\n# STAMP-APP-KEY-END'

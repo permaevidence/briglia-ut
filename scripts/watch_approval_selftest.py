@@ -238,17 +238,43 @@ def main():
               and rec.get("approval", {}).get("environment_id") == ENV_ID and rec.get("provenance") == "ci, phone-approved"
               and any("RECORDED" in m and "approved by user id %d" % REVIEWER in m for m in fake.telegram),
               (out[-600:], fake.telegram))
+        # The shape GitHub returned in the rehearsal (2026-10-05) for a
+        # "re-run failed jobs" attempt: every job NOT re-run reappears with a
+        # NEW id and run_attempt 2 but the original start/end/runner.
         jobs = jobs_ok(CLI_JOB_NAMES, 6200)
-        for j in jobs:
+        for i, j in enumerate(jobs):
+            j.update(started_at="2026-10-05T10:%02d:00Z" % i, completed_at="2026-10-05T10:%02d:30Z" % i,
+                     runner_name="GitHub Actions %d" % (1000 + i))
             if j["name"] == "Publish immutable release":
                 j["conclusion"] = "failure"
-        jobs.append({"id": 6299, "name": "Publish immutable release", "conclusion": "success", "run_attempt": 2})
+        carried = [dict(j, id=j["id"] + 50, run_attempt=2) for j in jobs if j["conclusion"] == "success"]
+        jobs += carried + [{"id": 6299, "name": "Publish immutable release", "conclusion": "success", "run_attempt": 2,
+                            "started_at": "2026-10-05T11:00:00Z", "completed_at": "2026-10-05T11:00:30Z",
+                            "runner_name": "GitHub Actions 2000"}]
         release("briglia-cli", "0.2.50", 62, C[3], run=cli_run(621, "0.2.50", 62, C[3], approvals=[approval()], jobs=jobs,
                                                               run_attempt=2))
         fake.telegram.clear()
         rc, out = run()
-        check("publish failed in attempt 1, re-run of the FAILED job only (attempt 2), one attempt-1 signing + one approval → recorded",
-              rc == 0 and recorded("briglia-cli").get("sequence") == 62, (out[-600:], fake.telegram))
+        check("publish failed in attempt 1, re-run of the FAILED job only (attempt 2): the carried copy of the attempt-1 "
+              "signing is the SAME execution → one signing + one approval → recorded",
+              rc == 0 and recorded("briglia-cli").get("sequence") == 62
+              and recorded("briglia-cli").get("approval", {}).get("sign_job_id") == 6205, (out[-600:], fake.telegram))
+        release("briglia-cli", "0.2.51", 63, C[10], run=cli_run(631, "0.2.51", 63, C[10], approvals=[approval()],
+                                                                jobs=[dict(j) for j in jobs_ok(CLI_JOB_NAMES, 6300)], run_attempt=2))
+        for i, j in enumerate(last_run("briglia-cli")["jobs"]):
+            j.update(started_at="2026-10-05T14:%02d:00Z" % i, completed_at="2026-10-05T14:%02d:30Z" % i,
+                     runner_name="GitHub Actions %d" % (4000 + i))
+        sign_a1 = next(j for j in last_run("briglia-cli")["jobs"] if j["name"] == "Sign metadata")
+        last_run("briglia-cli")["jobs"].append(dict(sign_a1, id=sign_a1["id"] + 1, run_attempt=2,
+                                                    started_at="2026-10-05T15:00:00Z"))
+        fake.telegram.clear()
+        rc, out = run()
+        check("a GENUINE second signing execution (re-run all jobs: new start time) → approval unverified, not recorded",
+              rc == 2 and recorded("briglia-cli").get("sequence") == 62
+              and any("approval unverified: 2 signing execution" in m for m in fake.telegram), (out[-600:], fake.telegram))
+        last_run("briglia-cli")["jobs"].pop()
+        rc, out = run()
+        check("…and with only the single attempt-1 signing it records", rc == 0 and recorded("briglia-cli").get("sequence") == 63, out[-400:])
 
         print("— app: local provenance boundary and CI approval —")
         release("briglia-ut", "0.8.5", 7, C[4], log=True)
