@@ -260,6 +260,40 @@ def quiesce_tests(root):
         srv.server_close()
 
 
+def restore_check_tests(root):
+    """restore-check.sh with throwaway keys: MATCH only for the right
+    passphrase AND the right expected key; nothing written; no echo."""
+    print("— owner restore check (plan §5 step 4) —")
+    d = os.path.join(root, "usb")
+    os.makedirs(d)
+    keys = {"cli": TestKey("briglia-cli"), "ut": TestKey("briglia-ut")}
+    openssl = subprocess.run(["bash", "-c", '. "%s/openssl-resolve.sh" && resolve_openssl >/dev/null && printf %%s "$OPENSSL"' % REL],
+                             capture_output=True, text=True).stdout
+    for k, pw in (("cli", "correct horse cli"), ("ut", "correct horse ut")):
+        subprocess.run([openssl, "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "600000", "-pass", "env:PASS", "-in",
+                        keys[k].priv, "-out", os.path.join(d, keys[k].key_id.replace("briglia-", "ada-") + ".priv.pem.enc")],
+                       env=dict(os.environ, PASS=pw), check=True, capture_output=True)
+    before = sorted(os.listdir(d))
+    env = {"EXPECTED_CLI_PUB": keys["cli"].pub, "EXPECTED_UT_PUB": keys["ut"].pub,
+           "CLI_SUFFIX": keys["cli"].fingerprint, "UT_SUFFIX": keys["ut"].fingerprint}
+
+    def rc_run(stdin, **over):
+        p = subprocess.run([os.path.join(REL, "restore-check.sh"), d], input=stdin, capture_output=True, text=True,
+                           env=dict(os.environ, **dict(env, **over)))
+        return p.returncode, p.stdout, p.stderr
+    rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n")
+    check("right passphrases → both MATCH, exit 0", rc == 0 and "CLI key: MATCH" in out and "UT key: MATCH" in out, out + err)
+    check("the passphrases never appear in any output", "correct horse" not in out + err, out + err)
+    rc, out, err = rc_run("wrong\ncorrect horse ut\n")
+    check("wrong CLI passphrase → CLI NO MATCH, exit ≠ 0, 'do NOT delete'", rc != 0 and "CLI key: NO MATCH" in out
+          and "UT key: MATCH" in out and "do NOT delete" in out, out)
+    rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n", EXPECTED_UT_PUB=keys["cli"].pub)
+    check("right passphrase but a different expected key → NO MATCH", rc != 0 and "UT key: NO MATCH" in out, out)
+    rc, out, err = rc_run("correct horse cli\ncorrect horse ut\n", UT_SUFFIX="0000000000000000")
+    check("backup missing on the stick → NO MATCH", rc != 0 and "UT key: NO MATCH" in out, out)
+    check("nothing was written next to the backups", sorted(os.listdir(d)) == before, os.listdir(d))
+
+
 def main():
     root = tempfile.mkdtemp(prefix="briglia-ut-ci-release-")
     host = FakeHost()
@@ -484,6 +518,7 @@ def main():
         rc, out, _ = stage(swapped, "swapped")
         check("envelope swapped for one signed by another key → refused", rc != 0 and "does not authenticate" in out, out)
         quiesce_tests(root)
+        restore_check_tests(root)
         for p in [os.path.join(root, x) for x in os.listdir(root) if x.startswith("staging-")]:
             for dp, dn, fn in os.walk(p):
                 os.chmod(dp, 0o755)
