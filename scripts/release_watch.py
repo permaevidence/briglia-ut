@@ -30,23 +30,31 @@ Per channel, `check`:
   3. asks the GitHub API: the latest release must be non-draft, immutable,
      carry the manifest's tag, and refs/tags/<tag> must still resolve to the
      recorded commit; no non-draft release may carry a higher version than
-     `latest` (a confused/frozen latest pointer);
+     `latest` (a confused/frozen latest pointer); EVERY non-draft release
+     must be immutable and tagged v<major>.<minor>.<patch> (a release on any
+     other tag was not made by the pipeline, yet could be marked latest);
   4. every asset in the manifest must be reachable at its immutable URL
      with the authenticated size (Range probe, hourly); once a day, or
      whenever the recorded release changes, every asset is downloaded in
      full with the size bound and its SHA-256 compared;
   5. CLI only: the released install.sh must be byte-identical to
      scripts/get-briglia.sh at the exact release tag;
-  6. optional website checks: the CLI install command must resolve (via
-     redirect) to the released installer bytes; the app page must link the
-     exact click URL from the app manifest;
+  6. optional website checks, on EVERY configured hostname (the Vercel alias
+     and the real domain briglia.dev, so a domain/DNS-only hijack is seen):
+     the CLI install command must resolve (via redirect) to the released
+     installer bytes; the app page must link the exact click URL from the
+     app manifest;
   7. optional transition check: a legacy Blob manifest still in service must
      agree with the authoritative release;
   8. metadata expiry within the warning window is an alert.
 
 Alert policy: a finding is sent when it first appears and re-sent every
 `realert_hours` while it persists; when it clears, one recovery message is
-sent. Undelivered Telegram messages are queued in the state file and
+sent. Network-class findings (the endpoint could not be reached — timeout,
+DNS, connection error, HTTP 5xx/429 — as opposed to answering with
+something wrong) are retried within the run and only announced after
+`transient_grace_checks` consecutive failing checks; one that clears
+before then is never announced, so it gets no recovery message either. Undelivered Telegram messages are queued in the state file and
 retried on the next run.
 
 Config (JSON; the installer writes the production one): see DEFAULT_CONFIG.
@@ -62,6 +70,7 @@ refuses to run with an empty memory — it sends one direct alert and exits
 """
 
 import argparse
+import http.client
 import datetime
 import fcntl
 import hashlib
@@ -90,6 +99,7 @@ USER_AGENT = "briglia-release-watch/" + WATCH_VERSION
 MAX_SMALL_FETCH = 512 * 1024          # envelopes, installers, API JSON, pages
 MAX_PAGE_FETCH = 4 * 1024 * 1024
 FULL_HASH_INTERVAL = 24 * 3600
+RELEASE_PAGE_SIZE = 100               # one page of /releases; a full page is reported as incomplete
 
 # Every channel entry carries an explicit `kind` (cli | app). The kind — not
 # the channel NAME — selects the verification policy and the corroboration
@@ -103,6 +113,10 @@ DEFAULT_CONFIG = {
     "telegram_env_file": "~/.claude/channels/telegram/.env",   # TELEGRAM_BOT_TOKEN, OWNER_CHAT_ID
     "telegram_api": "https://api.telegram.org",
     "realert_hours": 6,
+    # Network-class findings (GitHub/CDN timeouts, 5xx, DNS blips) are only
+    # announced once they have persisted for this many consecutive checks;
+    # integrity findings are always announced on the first check.
+    "transient_grace_checks": 3,
     "heartbeat_max_age_hours": 3,
     "expiry_warning_days": 30,
     "channels": {
@@ -112,20 +126,40 @@ DEFAULT_CONFIG = {
             "workflow_name": "Release (signed)",
             "installer_asset": "install.sh",
             "installer_source": "scripts/get-briglia.sh",
-            "website_install_url": "https://briglia.vercel.app/install.sh",
+            # Every URL is probed: the Vercel project alias AND the real
+            # domain, so a DNS/domain-only hijack of briglia.dev alerts too.
+            # A single string is still accepted (older configs).
+            "website_install_url": ["https://briglia.vercel.app/install.sh",
+                                    "https://briglia.dev/install.sh"],
             "legacy_blob_manifest": None,
         },
         "briglia-ut": {
             "kind": "app",
             "repo": "permaevidence/briglia-ut",
             "publication_log": "~/.briglia-release-keys/briglia-ut-publications.jsonl",
-            "website_page_url": "https://briglia.vercel.app/ubuntu-touch",
+            "website_page_url": ["https://briglia.vercel.app/ubuntu-touch",
+                                 "https://briglia.dev/ubuntu-touch"],
             "legacy_blob_manifest": None,
         },
     },
 }
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# The only tag shape the release pipeline ever publishes. Anything else on a
+# non-draft release is a release created outside the pipeline (the v* tag
+# ruleset does not cover it, yet it can be marked latest).
+_RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+
+
+def url_list(value):
+    """A config URL field: None/"" → [], a string → [it], a list → itself."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(u, str) and u for u in value):
+        return list(dict.fromkeys(value))
+    raise WatchError("URL config value must be a string or a list of strings, got %r" % (value,))
 
 
 # ------------------------------------------------------------------ utils
@@ -155,16 +189,57 @@ def fetch(url, max_bytes=MAX_SMALL_FETCH, headers=None, timeout=60, method="GET"
 
 
 class WatchError(Exception):
-    pass
+    def __init__(self, message, transient=False):
+        super().__init__(message)
+        self.transient = transient
 
 
-def gh_json(cfg, path, params=None):
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 15   # seconds between attempts within one run
+
+
+def is_network_error(exc):
+    """True when `exc` means "could not get an answer" (worth retrying, and
+    only worth a human's attention if it persists) rather than "got a wrong
+    answer". HTTPError is a URLError subclass, so it is checked first."""
+    if isinstance(exc, WatchError):
+        return exc.transient
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500 or exc.code == 429
+    return isinstance(exc, (urllib.error.URLError, OSError, http.client.HTTPException))
+
+
+def with_retries(fn, attempts=None, delay=None):
+    attempts = RETRY_ATTEMPTS if attempts is None else attempts
+    delay = RETRY_DELAY if delay is None else delay
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if i == attempts - 1 or not is_network_error(exc):
+                raise
+            time.sleep(delay)
+
+
+def gh_json(cfg, path, params=None, max_bytes=MAX_SMALL_FETCH):
     url = cfg["github_api"] + path + ("?" + urllib.parse.urlencode(params) if params else "")
     headers = {"Accept": "application/vnd.github+json"}
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = "Bearer " + token
-    status, _, body = fetch(url, headers=headers)
+    def once():
+        try:
+            st, _, b = fetch(url, max_bytes=max_bytes, headers=headers)
+        except WatchError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if is_network_error(exc):
+                raise WatchError("GitHub API %s → %s" % (path, exc), transient=True)
+            raise
+        if st >= 500 or st == 429:
+            raise WatchError("GitHub API %s → HTTP %s" % (path, st), transient=True)
+        return st, b
+    status, body = with_retries(once)
     if status != 200:
         raise WatchError("GitHub API %s → HTTP %s" % (path, status))
     try:
@@ -394,11 +469,16 @@ class Run:
         self.cfg = cfg
         self.state = state
         self.findings = {}   # key → text (ALERT level)
+        self.transient = set()  # keys whose finding is network-class only
         self.infos = []      # one-off informational messages
 
-    def alert(self, key, text):
-        print("  ✖ %s: %s" % (key, text))
+    def alert(self, key, text, transient=False):
+        print("  ✖ %s: %s%s" % (key, text, " (network)" if transient else ""))
         self.findings[key] = text
+        if transient:
+            self.transient.add(key)
+        else:
+            self.transient.discard(key)
 
     def info(self, text):
         print("  ℹ %s" % text)
@@ -412,10 +492,32 @@ class Run:
         list of messages actually composed (sent or queued)."""
         cfg, st = self.cfg, self.state.data
         realert = float(cfg["realert_hours"]) * 3600
+        grace = max(1, int(cfg.get("transient_grace_checks", 3)))
         messages = []
         active = st["active"]
         for key, text in self.findings.items():
             prev = active.get(key)
+            if key in self.transient:
+                if prev is None:
+                    prev = active[key] = {"first": now, "last_sent": now, "text": text,
+                                          "count": 0, "notified": False}
+                prev["count"] = int(prev.get("count", 0)) + 1
+                if not prev.get("notified", True):
+                    prev["text"] = text
+                    if prev["count"] >= grace:
+                        prev["notified"] = True
+                        prev["last_sent"] = now
+                        messages.append("🚨 briglia release watch — %s (failing for %d consecutive checks since %s)\n%s"
+                                        % (key, prev["count"], iso(prev["first"]), text))
+                elif now - prev["last_sent"] >= realert:
+                    # the exact network error varies run to run; only time re-alerts
+                    prev["last_sent"] = now
+                    prev["text"] = text
+                    messages.append("🚨 briglia release watch — STILL FAILING since %s — %s\n%s"
+                                    % (iso(prev["first"]), key, text))
+                continue
+            if prev is not None and not prev.get("notified", True):
+                prev = None   # a quiet network-class entry became a real finding: announce now
             if prev is None:
                 active[key] = {"first": now, "last_sent": now, "text": text}
                 messages.append("🚨 briglia release watch — %s\n%s" % (key, text))
@@ -426,7 +528,10 @@ class Run:
                                 % (iso(prev["first"]), key, text))
         for key in list(active):
             if key not in self.findings:
-                first = active.pop(key)["first"]
+                gone = active.pop(key)
+                if not gone.get("notified", True):
+                    continue   # never announced, so no recovery message
+                first = gone["first"]
                 messages.append("✅ briglia release watch — recovered: %s (failing since %s)" % (key, iso(first)))
         for text in self.infos:
             messages.append("ℹ️ briglia release watch — %s" % text)
@@ -511,6 +616,16 @@ def resolve_tag(cfg, repo, tag):
     raise WatchError("annotated tag chain too deep for %s" % tag)
 
 
+def probe_asset_checked(url, size):
+    """probe_asset, but a 5xx/429 answer raises (retryable) instead of
+    being reported as a size problem."""
+    err = probe_asset(url, size)
+    m = re.match(r"^HTTP (\d+)$", err or "")
+    if m and (int(m.group(1)) >= 500 or int(m.group(1)) == 429):
+        raise WatchError("%s → %s" % (url, err), transient=True)
+    return err
+
+
 def probe_asset(url, size):
     """Range probe: the immutable URL must answer with exactly `size` total bytes."""
     status, headers, body = fetch(url, max_bytes=2, headers={"Range": "bytes=0-0"})
@@ -588,6 +703,34 @@ def corroborate_app(cfg, chan, run, record):
     return ("publication log disagrees with the live release: " + ", ".join(problems)) if problems else None
 
 
+def check_website_installers(run, channel, chan, released):
+    """Every website install URL is probed independently: a failure on one
+    host never skips another host, nor discards a mismatch already found on
+    another. All problems go into ONE `website-installer` finding, which is
+    network-class (grace period) only when EVERY problem is a network
+    failure — a confirmed wrong answer from any host alerts at once."""
+    try:
+        site_urls = url_list(chan.get("website_install_url"))
+    except WatchError as exc:
+        run.alert(channel + "/config-invalid", str(exc))
+        return
+    site_bad, site_net = [], True
+    for site_url in site_urls:
+        try:
+            s3, _, via_site = fetch(site_url)
+        except Exception as exc:  # noqa: BLE001 — record, then check the next host
+            site_bad.append("%s: fetch failed: %s" % (site_url, exc))
+            site_net = site_net and is_network_error(exc)
+            continue
+        if s3 != 200 or via_site != released:
+            site_bad.append("%s does not resolve to the released installer (HTTP %s)" % (site_url, s3))
+            site_net = False
+        else:
+            run.ok("website install URL %s resolves to the released installer" % site_url)
+    if site_bad:
+        run.alert(channel + "/website-installer", "; ".join(site_bad), transient=site_net)
+
+
 def check_channel(cfg, channel, run, now):
     chan = cfg["channels"][channel]
     repo = chan["repo"]
@@ -602,9 +745,10 @@ def check_channel(cfg, channel, run, now):
 
     # 1. authenticate the live envelope
     try:
-        raw = rv.bounded_fetch(policy.envelope_url, rv.MAX_ENVELOPE_BYTES)
+        raw = with_retries(lambda: rv.bounded_fetch(policy.envelope_url, rv.MAX_ENVELOPE_BYTES))
     except Exception as exc:  # noqa: BLE001
-        run.alert(channel + "/envelope-unreachable", "cannot fetch %s: %s" % (policy.envelope_url, exc))
+        run.alert(channel + "/envelope-unreachable", "cannot fetch %s: %s" % (policy.envelope_url, exc),
+                  transient=is_network_error(exc))
         return
     try:
         manifest = rv.verify_envelope(raw, policy, now)
@@ -626,7 +770,8 @@ def check_channel(cfg, channel, run, now):
         latest = gh_json(cfg, "/repos/%s/releases/latest" % repo)
         tag_commit = resolve_tag(cfg, repo, tag)
     except WatchError as exc:
-        run.alert(channel + "/github-unreachable", "cannot query GitHub: %s" % exc)
+        run.alert(channel + "/github-unreachable", "cannot query GitHub: %s" % exc,
+                  transient=is_network_error(exc))
         return
     if latest.get("tag_name") != tag or latest.get("draft") is not False:
         run.alert(channel + "/latest-mismatch",
@@ -667,9 +812,13 @@ def check_channel(cfg, channel, run, now):
 
     # 3b. latest pointer confusion: no non-draft release may out-version latest
     try:
-        releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": 100})
+        # The full release list grows ~22 KB per release (three platforms of
+        # assets each); it passed 512 KiB at 29 releases. Allow the page cap.
+        releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": RELEASE_PAGE_SIZE},
+                           max_bytes=MAX_PAGE_FETCH)
     except WatchError as exc:
-        run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc)
+        run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc,
+                  transient=is_network_error(exc))
         releases = []
     newer = [r["tag_name"] for r in releases
              if not r.get("draft") and semver_tuple(r.get("tag_name"))
@@ -680,19 +829,45 @@ def check_channel(cfg, channel, run, now):
     drafts = [r["tag_name"] for r in releases if r.get("draft")]
     if drafts:
         run.info("%s: draft release(s) present: %s" % (channel, ", ".join(drafts)))
+    # Every published (non-draft) release — not just latest — must carry a
+    # pipeline-shaped v<semver> tag and be immutable. Drafts are never
+    # immutable and are reported above.
+    published = [r for r in releases if not r.get("draft")]
+    bad_tags = [str(r.get("tag_name")) for r in published
+                if not isinstance(r.get("tag_name"), str) or not _RELEASE_TAG_RE.match(r["tag_name"])]
+    if bad_tags:
+        run.alert(channel + "/release-bad-tag",
+                  "published release(s) whose tag is not v<major>.<minor>.<patch> — not made by the release "
+                  "pipeline: %s" % ", ".join(sorted(bad_tags)))
+    mutable = [str(r.get("tag_name")) for r in published if r.get("immutable") is not True]
+    if mutable:
+        run.alert(channel + "/release-not-immutable",
+                  "published release(s) that are NOT immutable: %s" % ", ".join(sorted(mutable)))
+    if len(releases) >= RELEASE_PAGE_SIZE:
+        # Only the first page is read: say so instead of claiming "all".
+        run.alert(channel + "/release-list-incomplete",
+                  "the release list filled one page (%d); releases beyond it are NOT checked for tag shape, "
+                  "immutability or out-versioning latest — add pagination" % len(releases))
+    elif releases and not bad_tags and not mutable:
+        run.ok("all %d published release(s) are immutable with v<semver> tags" % len(published))
 
     # 4. assets: probe hourly, full hash daily / after change
     problems = []
+    network_only = True
     for name, a in live["assets"].items():
         err = None
         try:
-            err = probe_asset(a["url"], a["size"])
+            err = with_retries(lambda: probe_asset_checked(a["url"], a["size"]))
         except Exception as exc:  # noqa: BLE001
             err = str(exc)
+            network_only = network_only and is_network_error(exc)
+        else:
+            if err:
+                network_only = False
         if err:
             problems.append("%s: %s" % (name, err))
     if problems:
-        run.alert(channel + "/asset-unreachable", "; ".join(problems))
+        run.alert(channel + "/asset-unreachable", "; ".join(problems), transient=network_only)
     else:
         run.ok("%d asset(s) reachable with the signed sizes" % len(live["assets"]))
     last_full = st["full_hash_at"].get(channel, 0)
@@ -725,30 +900,38 @@ def check_channel(cfg, channel, run, now):
                           "released %s differs from %s at %s" % (chan["installer_asset"], chan["installer_source"], tag))
             else:
                 run.ok("released installer is byte-identical to %s@%s" % (chan["installer_source"], tag))
-                if chan.get("website_install_url"):
-                    s3, _, via_site = fetch(chan["website_install_url"])
-                    if s3 != 200 or via_site != released:
-                        run.alert(channel + "/website-installer",
-                                  "%s does not resolve to the released installer (HTTP %s)" % (chan["website_install_url"], s3))
-                    else:
-                        run.ok("website install URL resolves to the released installer")
+                check_website_installers(run, channel, chan, released)
         except Exception as exc:  # noqa: BLE001
-            run.alert(channel + "/installer", "installer check failed: %s" % exc)
+            run.alert(channel + "/installer", "installer check failed: %s" % exc,
+                      transient=is_network_error(exc))
 
-    # 6. website page must link the exact asset (app)
-    if chan.get("website_page_url"):
+    # 6. website page must link the exact asset (app). One finding key for
+    # all page URLs, so the known ISR lag right after an app release (the
+    # page is revalidated on a visit, ~300 s) still produces ONE alert, as
+    # before, rather than one per hostname.
+    try:
+        page_urls = url_list(chan.get("website_page_url"))
+    except WatchError as exc:
+        run.alert(channel + "/config-invalid", str(exc))
+        page_urls = []
+    page_bad, page_net = [], True
+    for page_url in page_urls:
         try:
-            s, _, page = fetch(chan["website_page_url"], max_bytes=MAX_PAGE_FETCH)
+            s, _, page = fetch(page_url, max_bytes=MAX_PAGE_FETCH)
             urls = [a["url"] for a in live["assets"].values()]
             if s != 200:
-                run.alert(channel + "/website-page", "%s → HTTP %s" % (chan["website_page_url"], s))
+                page_bad.append("%s → HTTP %s" % (page_url, s))
+                page_net = False
             elif not all(u.encode() in page for u in urls):
-                run.alert(channel + "/website-page", "%s does not link the released asset(s) %s"
-                          % (chan["website_page_url"], ", ".join(urls)))
+                page_bad.append("%s does not link the released asset(s) %s" % (page_url, ", ".join(urls)))
+                page_net = False
             else:
-                run.ok("website page links the released asset")
+                run.ok("website page %s links the released asset" % page_url)
         except Exception as exc:  # noqa: BLE001
-            run.alert(channel + "/website-page", "page check failed: %s" % exc)
+            page_bad.append("%s: page check failed: %s" % (page_url, exc))
+            page_net = page_net and is_network_error(exc)
+    if page_bad:
+        run.alert(channel + "/website-page", "; ".join(page_bad), transient=page_net)
 
     # 7. transition: a legacy manifest still in service must agree
     if chan.get("legacy_blob_manifest"):
@@ -763,7 +946,8 @@ def check_channel(cfg, channel, run, now):
             else:
                 run.ok("legacy transition manifest agrees with the authoritative release")
         except Exception as exc:  # noqa: BLE001
-            run.alert(channel + "/legacy-blob", "legacy manifest check failed: %s" % exc)
+            run.alert(channel + "/legacy-blob", "legacy manifest check failed: %s" % exc,
+                      transient=is_network_error(exc))
 
     # 8. expiry
     days_left = (manifest["expires"] - now) / 86400
