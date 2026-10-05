@@ -24,24 +24,46 @@ resolve_openssl >/dev/null 2>&1 || { echo "✖ no Ed25519-capable openssl"; exit
 CLI_PUB="${EXPECTED_CLI_PUB:-$HOME/Desktop/briglia-cli/.github/release-keys/briglia-cli-release.pub.pem}"
 UT_PUB="${EXPECTED_UT_PUB:-$HERE/../../.release-keys/briglia-ut-release.pub.pem}"
 fail=0
+# An Ed25519 SubjectPublicKeyInfo is exactly 44 DER bytes with this fixed
+# 12-byte prefix. Identity is ONLY ever a validated key of this shape: a
+# failed conversion's empty (or partial) output must never stand in for one
+# (Codex 2026-10-05: two failed conversions hashed to the same empty digest
+# and reported MATCH).
+ed25519_spki_ok() { [ "${#1}" = 88 ] && [ "${1:0:24}" = "302a300506032b6570032100" ]; }
 check_one() {  # label suffix expected-pub
-    local label="$1" suffix="$2" pub="$3" enc want got pass
+    local label="$1" suffix="$2" pub="$3" enc="" want="" got="" pass="" want_rc=1 got_rc=1 read_ok=1
     enc="$(ls "$DIR"/*-release-v1-"$suffix".priv.pem.enc 2>/dev/null | head -n 1)"
-    if [ -z "$enc" ] || [ ! -f "$pub" ]; then
-        echo "$label: NO MATCH (backup *-$suffix.priv.pem.enc or expected key not found)"; fail=1; return
-    fi
-    want="$("$OPENSSL" pkey -pubin -in "$pub" -outform DER 2>/dev/null | "$OPENSSL" dgst -sha256 -hex | awk '{print $NF}')"
+    # The passphrase is ALWAYS read (one line per key), so a problem with the
+    # first key never shifts the second key's passphrase onto the wrong prompt.
     printf '%s passphrase (input hidden): ' "$label" >&2
-    IFS= read -rs pass; echo >&2
+    IFS= read -rs pass || read_ok=0
+    echo >&2
+    if [ -z "$enc" ] || [ ! -f "$enc" ] || [ ! -s "$enc" ] || [ ! -r "$enc" ]; then
+        pass=""; echo "$label: NO MATCH (backup *-$suffix.priv.pem.enc not found, empty or unreadable)"; fail=1; return
+    fi
+    if [ ! -f "$pub" ] || [ ! -r "$pub" ]; then
+        pass=""; echo "$label: NO MATCH (expected public key $pub not found or unreadable)"; fail=1; return
+    fi
+    want="$(set -o pipefail; "$OPENSSL" pkey -pubin -in "$pub" -outform DER 2>/dev/null | od -An -v -tx1 | tr -d ' \n')"; want_rc=$?
+    if [ "$want_rc" != 0 ] || ! ed25519_spki_ok "$want"; then
+        pass=""; echo "$label: NO MATCH (expected public key $pub is not a valid Ed25519 public key)"; fail=1; return
+    fi
+    if [ "$read_ok" != 1 ] || [ -z "$pass" ]; then
+        pass=""; echo "$label: NO MATCH (no passphrase was entered)"; fail=1; return
+    fi
     # The passphrase reaches openssl on its stdin through the printf BUILTIN:
     # never an argument, never an environment variable of a child process.
-    got="$(printf '%s\n' "$pass" | "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass stdin -in "$enc" 2>/dev/null \
-            | "$OPENSSL" pkey -pubout -outform DER 2>/dev/null | "$OPENSSL" dgst -sha256 -hex | awk '{print $NF}')"
+    # The decrypted key exists only inside this pipe; every stage's status
+    # counts (pipefail inside the substitution, checked below).
+    got="$(set -o pipefail; printf '%s\n' "$pass" | "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass stdin -in "$enc" 2>/dev/null \
+            | "$OPENSSL" pkey -pubout -outform DER 2>/dev/null | od -An -v -tx1 | tr -d ' \n')"; got_rc=$?
     pass=""
-    if [ -n "$want" ] && [ "$got" = "$want" ]; then
+    if [ "$got_rc" != 0 ] || ! ed25519_spki_ok "$got"; then
+        echo "$label: NO MATCH (the backup did not decrypt to an Ed25519 key — wrong passphrase or damaged backup)"; fail=1
+    elif [ "$got" = "$want" ]; then
         echo "$label: MATCH"
     else
-        echo "$label: NO MATCH"; fail=1
+        echo "$label: NO MATCH (the backup restores a DIFFERENT key than the committed one)"; fail=1
     fi
 }
 check_one "CLI key" "${CLI_SUFFIX:-94d967bae0867c2e}" "$CLI_PUB"
