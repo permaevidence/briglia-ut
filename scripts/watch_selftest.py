@@ -47,7 +47,10 @@ class Fake:
         self.assets = {}           # (channel, version, name) -> bytes
         self.releases = {}         # repo -> [ {tag_name, draft, immutable, id} ]
         self.tags = {}             # repo -> {tag: sha}
-        self.runs = {}             # repo -> [ {id, name, head_sha, head_branch, status, conclusion, jobs:[...]}, ]
+        self.runs = {}             # repo -> [ {id, name, path, event, workflow_id, repository, head_sha, head_branch,
+        #                                  status, conclusion, run_attempt, jobs:[...], approvals:[...]}, ]
+        self.workflows = {}        # repo -> workflow object (default: id 77 at .github/workflows/release-signed.yml)
+        self.environments = {}     # repo -> {name: {id, name}}
         self.raw = {}              # (repo, tag, path) -> bytes
         self.site_installer = None  # bytes served by /site/cli/install.sh (None → redirect to release asset)
         self.site_installer_redirect = None
@@ -170,15 +173,45 @@ class Fake:
                             if isinstance(t, dict) and t["tag_sha"] == m.group(2):
                                 return self._json(200, {"object": {"type": "commit", "sha": t["commit"]}})
                         return self._json(404, {})
-                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/actions/runs$", p)
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/actions/workflows/([^/]+)$", p)
+                    if m:
+                        wf = fake.workflows.get(m.group(1), {"id": 77, "path": ".github/workflows/release-signed.yml",
+                                                             "name": "Release (signed)", "state": "active"})
+                        if m.group(2) in (os.path.basename(wf["path"]), str(wf["id"])) or fake.faults.get("wf_any_name"):
+                            return self._json(200, wf)
+                        return self._json(404, {"message": "Not Found"})
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/actions/(?:workflows/(\d+)/)?runs$", p)
                     if m:
                         branch = q.get("branch", [None])[0]
-                        runs = [dict(r, jobs=None) for r in fake.runs.get(m.group(1), []) if r["head_branch"] == branch]
-                        return self._json(200, {"workflow_runs": runs})
+                        page = int(q.get("page", ["1"])[0])
+                        runs = [{k: v for k, v in r.items() if k not in ("jobs", "approvals")}
+                                for r in fake.runs.get(m.group(1), []) if r["head_branch"] == branch
+                                and (m.group(2) is None or fake.faults.get("runs_unfiltered")
+                                     or str(r.get("workflow_id")) == m.group(2))]
+                        return self._json(200, {"total_count": len(runs), "workflow_runs": runs if page == 1 else []})
                     m = re.match(r"^/api/repos/([^/]+/[^/]+)/actions/runs/(\d+)/jobs$", p)
                     if m:
                         r = next((r for r in fake.runs.get(m.group(1), []) if r["id"] == int(m.group(2))), None)
-                        return self._json(200, {"jobs": r["jobs"]}) if r else self._json(404, {})
+                        if not r:
+                            return self._json(404, {})
+                        jobs = r["jobs"] if int(q.get("page", ["1"])[0]) == 1 else []
+                        if q.get("filter", ["latest"])[0] == "latest":
+                            best = {}
+                            for j in jobs:
+                                if j["name"] not in best or j.get("run_attempt", 1) >= best[j["name"]].get("run_attempt", 1):
+                                    best[j["name"]] = j
+                            jobs = list(best.values())
+                        return self._json(200, {"total_count": len(jobs), "jobs": jobs})
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/actions/runs/(\d+)/approvals$", p)
+                    if m:
+                        if fake.faults.get("approvals_status"):
+                            return self._json(fake.faults["approvals_status"], {"message": "injected"})
+                        r = next((r for r in fake.runs.get(m.group(1), []) if r["id"] == int(m.group(2))), None)
+                        return self._json(200, r.get("approvals", [])) if r else self._json(404, {})
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/environments/([^/]+)$", p)
+                    if m:
+                        env = fake.environments.get(m.group(1), {}).get(m.group(2))
+                        return self._json(200, env) if env else self._json(404, {"message": "Not Found"})
                 self._send(404)
 
             do_HEAD = do_GET
@@ -193,9 +226,27 @@ class Fake:
         self.server.server_close()
 
 
-JOBS_OK = [{"name": n, "conclusion": "success"} for n in
-           ("Authorize (credential-free)", "Build macOS arm64", "Sign metadata", "Publish immutable release",
-            "Verify public channel (linux)", "Verify public channel (macos)", "Verify public channel (linux-arm64)")]
+CLI_JOB_NAMES = ("Authorize (credential-free)", "Build macOS arm64", "Build Linux x64", "Build Linux arm64 (native)",
+                 "Assemble manifest", "Sign metadata", "Verify candidate (macos)", "Verify candidate (linux)",
+                 "Verify candidate (linux-arm64)", "Publish immutable release", "Verify public channel (macos)",
+                 "Verify public channel (linux)", "Verify public channel (linux-arm64)")
+APP_JOB_NAMES = ("Authorize (credential-free)", "Build click (Linux)", "Build click (macOS, reproducibility)",
+                 "Assemble manifest", "Sign metadata", "Verify candidate", "Publish immutable release",
+                 "Verify public channel")
+
+
+def jobs_ok(names, base_id=900000):
+    return [{"id": base_id + i, "name": n, "conclusion": "success", "run_attempt": 1} for i, n in enumerate(names)]
+
+
+JOBS_OK = jobs_ok(CLI_JOB_NAMES)
+
+
+def signed_run(repo, run_id, tag, commit, seq, jobs, conclusion="success", approvals=None):
+    return {"id": run_id, "name": "Release (signed)", "path": ".github/workflows/release-signed.yml", "event": "push",
+            "workflow_id": 77, "repository": {"full_name": repo}, "head_sha": commit, "head_branch": tag,
+            "run_number": seq, "run_attempt": 1, "status": "completed", "conclusion": conclusion,
+            "jobs": jobs, "approvals": approvals or []}
 
 
 def main():
@@ -229,13 +280,15 @@ def main():
         "telegram_env_file": tg_env, "telegram_api": B + "/tg",
         "realert_hours": 6, "heartbeat_max_age_hours": 3, "expiry_warning_days": 30,
         "channels": {
-            "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "workflow_name": "Release (signed)",
+            "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "approval_required_above_sequence": 60,
+                        "approver_user_id": 4242001,
                         "installer_asset": "install.sh", "installer_source": "scripts/get-briglia.sh",
                         "website_install_url": [B + "/site/cli/install.sh", B + "/domain/cli/install.sh"],
                         "envelope_url": B + "/latest/briglia-cli/manifest.sig.json",
                         "artifact_url_prefix": B + "/download/briglia-cli/v{version}/",
                         "legacy_blob_manifest": None},
             "briglia-ut": {"kind": "app", "repo": "test/briglia-ut", "publication_log": pub_log,
+                       "approval_required_above_sequence": 7, "approver_user_id": 4242001,
                        "website_page_url": [B + "/site/app", B + "/domain/app"],
                        "envelope_url": B + "/latest/briglia-ut/manifest.sig.json",
                        "artifact_url_prefix": B + "/download/briglia-ut/v{version}/",
@@ -283,10 +336,10 @@ def main():
             fake.raw[(repo_name, "v" + version, "scripts/get-briglia.sh")] = assets.get("install.sh", b"")
             fake.site_installer_redirect = "%s/download/briglia-cli/v%s/install.sh" % (B, version)
             if workflow:
-                fake.runs.setdefault(repo_name, []).append({
-                    "id": 500 + seq, "name": "Release (signed)", "head_sha": commit, "head_branch": "v" + version,
-                    "run_number": seq, "status": "completed", "conclusion": workflow,
-                    "jobs": JOBS_OK if workflow == "success" else [{"name": "Sign metadata", "conclusion": "failure"}]})
+                fake.runs.setdefault(repo_name, []).append(signed_run(
+                    repo_name, 500 + seq, "v" + version, commit, seq,
+                    JOBS_OK if workflow == "success" else [{"id": 1, "name": "Sign metadata", "conclusion": "failure",
+                                                            "run_attempt": 1}], conclusion=workflow))
         else:
             click = assets["click"]
             fake.site_page = ("<a href=\"%s/download/briglia-ut/v%s/click\">download</a>" % (B, version)).encode()

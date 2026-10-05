@@ -9,6 +9,8 @@ or string comparison against pinned keys and a locally recorded history.
 
     release_watch.py check      [--config PATH]   # hourly
     release_watch.py status     [--config PATH]   # print the recorded state
+    release_watch.py acknowledge-local CHANNEL TAG ENVELOPE_SHA256 [--config PATH]
+        # owner-only: accept ONE break-glass local release as local provenance
 
 The watcher watching itself is a SEPARATE program, scripts/release_heartbeat.py
 (stdlib only, its own state and lock): it reads nothing from this module and
@@ -22,11 +24,25 @@ Per channel, `check`:
      URLs locked to the per-version release location);
   2. compares it with the newest RECORDED authorized release: identical →
      fine; strictly higher sequence → a candidate new release that must be
-     corroborated (CLI: the "Release (signed)" workflow run for that exact
-     tag commit succeeded, every job; app: the local publication log written
-     by publish_click.sh names exactly this tag/sequence/envelope) before it
-     is recorded — and its recording is announced, never silent; lower
-     sequence → ROLLBACK alert; same sequence but any difference → alert;
+     corroborated before it is recorded — and its recording is announced,
+     never silent; lower sequence → ROLLBACK alert; same sequence but any
+     difference → alert. Corroboration (UT signing-in-CI plan §3.3, both
+     channels, per-channel parameters): exactly one push run of the workflow
+     at `workflow_path` (matched by path + workflow id, never by display
+     name) for this tag at the recorded commit, completed/success, every
+     configured required job successful (a skipped required job fails);
+     above the channel's `approval_required_above_sequence` cutoff, the
+     signing job executed exactly once (run attempt 1) and the run's review
+     history holds exactly one approval for the signing environment's id,
+     by the configured reviewer's stable user id, and no rejection — any
+     error, missing field or ambiguity is "approval unverified", never
+     success. At or below the cutoff the release predates the approval
+     gate (CLI) or the CI pipeline (app: corroborated by the local
+     publication log, as before). Above the cutoff the app's local
+     publication log is never accepted: a break-glass local release is an
+     alert labelled "local provenance, not phone-approved CI" until the
+     owner runs `acknowledge-local`, and is then recorded as local
+     provenance, never as CI-approved;
   3. asks the GitHub API: the latest release must be non-draft, immutable,
      carry the manifest's tag, and refs/tags/<tag> must still resolve to the
      recorded commit; no non-draft release may carry a higher version than
@@ -123,7 +139,21 @@ DEFAULT_CONFIG = {
         "briglia-cli": {
             "kind": "cli",
             "repo": "permaevidence/briglia-cli",
-            "workflow_name": "Release (signed)",
+            "workflow_path": ".github/workflows/release-signed.yml",
+            # exact job names in briglia-cli's release-signed.yml; all must
+            # succeed (no weakening of the three public checks)
+            "required_jobs": ["Authorize (credential-free)", "Build macOS arm64", "Build Linux x64",
+                              "Build Linux arm64 (native)", "Assemble manifest", "Sign metadata",
+                              "Verify candidate (macos)", "Verify candidate (linux)",
+                              "Verify candidate (linux-arm64)", "Publish immutable release",
+                              "Verify public channel (macos)", "Verify public channel (linux)",
+                              "Verify public channel (linux-arm64)"],
+            "signing_job": "Sign metadata",
+            "signing_environment": "release-sign",
+            "approver_user_id": 338251426,          # matteoiannius-beep — stable id, never the login
+            # v0.2.49 (sequence 109) was published before the approval gate
+            # and stays recorded without an invented approval.
+            "approval_required_above_sequence": 109,
             "installer_asset": "install.sh",
             "installer_source": "scripts/get-briglia.sh",
             # Every URL is probed: the Vercel project alias AND the real
@@ -136,6 +166,17 @@ DEFAULT_CONFIG = {
         "briglia-ut": {
             "kind": "app",
             "repo": "permaevidence/briglia-ut",
+            "workflow_path": ".github/workflows/release-signed.yml",
+            "required_jobs": ["Authorize (credential-free)", "Build click (Linux)",
+                              "Build click (macOS, reproducibility)", "Assemble manifest", "Sign metadata",
+                              "Verify candidate", "Publish immutable release", "Verify public channel"],
+            "signing_job": "Sign metadata",
+            "signing_environment": "release-sign",
+            "approver_user_id": 338251426,
+            # v0.8.5 (sequence 7) and earlier were signed locally and keep
+            # their local provenance; above it the publication log is never
+            # accepted.
+            "approval_required_above_sequence": 7,
             "publication_log": "~/.briglia-release-keys/briglia-ut-publications.jsonl",
             "website_page_url": ["https://briglia.vercel.app/ubuntu-touch",
                                  "https://briglia.dev/ubuntu-touch"],
@@ -297,6 +338,10 @@ def validate_state(data):
     for key, a in data.get("active", {}).items():
         if not isinstance(a, dict) or not isinstance(a.get("first"), (int, float)) or not isinstance(a.get("last_sent"), (int, float)):
             raise ValueError("active[%s] malformed" % key)
+    acks = data.get("local_acks", {})
+    if not isinstance(acks, dict) or any(not isinstance(v, dict) or any(not isinstance(t, str) or not isinstance(h, str)
+                                                                         for t, h in v.items()) for v in acks.values()):
+        raise ValueError("local_acks malformed")
 
 
 class State:
@@ -651,26 +696,127 @@ def full_hash(url, size, sha256):
     return err
 
 
-def corroborate_cli(cfg, chan, run, record):
-    """The signed workflow run for this exact tag commit succeeded, every job."""
-    repo = chan["repo"]
-    runs = gh_json(cfg, "/repos/%s/actions/runs" % repo,
-                   {"event": "push", "branch": record["tag"], "per_page": 20}).get("workflow_runs", [])
-    match = [r for r in runs if r.get("name") == chan["workflow_name"]
-             and r.get("head_sha") == record["commit"]]
-    if not match:
-        return "no '%s' workflow run found for %s at %s" % (chan["workflow_name"], record["tag"], record["commit"][:12])
-    r = sorted(match, key=lambda r: r.get("run_number", 0))[-1]
+def _paged(cfg, path, key, params=None, max_pages=10):
+    """Every item of a paginated list endpoint; an endpoint that never ends
+    within max_pages × 100 items is an error, never a silent truncation."""
+    items = []
+    for page in range(1, max_pages + 1):
+        p = dict(params or {}, per_page=100, page=page)
+        data = gh_json(cfg, path, p, max_bytes=MAX_PAGE_FETCH)
+        chunk = data.get(key) if isinstance(data, dict) else None
+        if not isinstance(chunk, list):
+            raise WatchError("GitHub API %s: no %r list in the answer" % (path, key))
+        items += chunk
+        if len(chunk) < 100:
+            return items
+    raise WatchError("GitHub API %s: more than %d pages — refusing to judge a truncated list" % (path, max_pages))
+
+
+def _int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def corroborate_signed_run(cfg, chan, run, record, require_approval):
+    """The release-signed workflow run for this exact tag commit (plan
+    §3.3): identity by repository + workflow path + workflow id, every
+    required job successful, and — above the cutoff — approval evidence
+    bound to the run's single signing execution. Returns None when
+    corroborated (and annotates `record`), else the reason."""
+    repo, tag, commit = chan["repo"], record["tag"], record["commit"]
+    path = chan.get("workflow_path") or ""
+    required = chan.get("required_jobs")
+    if not path or not isinstance(required, list) or not required:
+        return "config lacks workflow_path/required_jobs for this channel"
+    wf = gh_json(cfg, "/repos/%s/actions/workflows/%s" % (repo, os.path.basename(path)))
+    wf_id = _int(wf.get("id"))
+    if wf.get("path") != path or wf_id is None:
+        return "workflow %s not found by path (answered path %r)" % (path, wf.get("path"))
+    runs = _paged(cfg, "/repos/%s/actions/workflows/%d/runs" % (repo, wf_id), "workflow_runs",
+                  {"event": "push", "branch": tag})
+    for_tag = [r for r in runs if r.get("head_branch") == tag and r.get("event") == "push"]
+    if len(for_tag) > 1:
+        return "%d '%s' runs exist for %s (%s) — expected exactly one" % (
+            len(for_tag), path, tag, ", ".join(str(r.get("id")) for r in for_tag))
+    if not for_tag:
+        return "no %s push run found for %s" % (path, tag)
+    r = for_tag[0]
+    rid = _int(r.get("id"))
+    problems = []
+    if r.get("head_sha") != commit:
+        problems.append("head_sha %s ≠ recorded commit %s" % (str(r.get("head_sha"))[:12], commit[:12]))
+    if r.get("path") != path:
+        problems.append("run path %r ≠ %s" % (r.get("path"), path))
+    if _int(r.get("workflow_id")) != wf_id:
+        problems.append("workflow_id %r ≠ %d" % (r.get("workflow_id"), wf_id))
+    if (r.get("repository") or {}).get("full_name") != repo:
+        problems.append("repository %r ≠ %s" % ((r.get("repository") or {}).get("full_name"), repo))
+    if rid is None:
+        problems.append("run has no id")
+    if problems:
+        return "the %s run for %s does not match: %s" % (path, tag, "; ".join(problems))
     if r.get("status") != "completed" or r.get("conclusion") != "success":
-        return "workflow run %s for %s is %s/%s" % (r.get("id"), record["tag"], r.get("status"), r.get("conclusion"))
-    jobs = gh_json(cfg, "/repos/%s/actions/runs/%s/jobs" % (repo, r["id"]), {"per_page": 100}).get("jobs", [])
-    bad = [j["name"] for j in jobs if j.get("conclusion") not in ("success", "skipped")]
-    if not jobs or bad:
-        return "workflow run %s has failed/unknown jobs: %s" % (r.get("id"), bad or "none listed")
-    verify_jobs = [j for j in jobs if j["name"].startswith("Verify public channel")]
-    if len(verify_jobs) < 3 or any(j.get("conclusion") != "success" for j in verify_jobs):
-        return "workflow run %s lacks three successful public verification jobs" % r.get("id")
-    record["workflow_run"] = r["id"]
+        return "workflow run %s for %s is %s/%s" % (rid, tag, r.get("status"), r.get("conclusion"))
+    jobs = _paged(cfg, "/repos/%s/actions/runs/%d/jobs" % (repo, rid), "jobs", {"filter": "all"})
+    bad = []
+    for name in required:
+        recs = [j for j in jobs if j.get("name") == name]
+        if not recs:
+            bad.append("%s: missing" % name)
+            continue
+        latest = max(recs, key=lambda j: (_int(j.get("run_attempt")) or 0, _int(j.get("id")) or 0))
+        if latest.get("conclusion") != "success":
+            bad.append("%s: %s" % (name, latest.get("conclusion")))
+    if bad:
+        return "workflow run %s: required job(s) not successful: %s" % (rid, "; ".join(bad))
+    record["workflow_run"] = rid
+    if not require_approval:
+        return None
+
+    # --- approval bound to the single signing execution
+    sign_name = chan.get("signing_job") or ""
+    signs = {}
+    for j in jobs:
+        if j.get("name") == sign_name:
+            signs[_int(j.get("id"))] = j
+    if None in signs or len(signs) != 1:
+        return ("approval unverified: %d signing execution(s) of '%s' in run %s — one approval cannot be bound "
+                "to more than one signing attempt" % (len(signs), sign_name, rid))
+    sign = next(iter(signs.values()))
+    if _int(sign.get("run_attempt")) != 1 or sign.get("conclusion") != "success":
+        return ("approval unverified: the signing job ran in attempt %r (%s) — only a successful attempt-1 "
+                "signing is bound to the run's approval" % (sign.get("run_attempt"), sign.get("conclusion")))
+    env_name = chan.get("signing_environment") or ""
+    env = gh_json(cfg, "/repos/%s/environments/%s" % (repo, env_name))
+    env_id = _int(env.get("id"))
+    if env.get("name") != env_name or env_id is None:
+        return "approval unverified: environment %r answered name %r id %r" % (env_name, env.get("name"), env.get("id"))
+    approvals = gh_json(cfg, "/repos/%s/actions/runs/%d/approvals" % (repo, rid))
+    if not isinstance(approvals, list):
+        return "not approved: the review history is not a list (unexpected API shape)"
+    mine = []
+    for a in approvals:
+        if not isinstance(a, dict) or not isinstance(a.get("environments"), list) \
+                or not isinstance(a.get("user"), dict) or not isinstance(a.get("state"), str):
+            return "not approved: a review-history entry has an unexpected shape"
+        ids = [_int((e or {}).get("id")) if isinstance(e, dict) else None for e in a["environments"]]
+        if None in ids:
+            return "not approved: a review-history environment has no id"
+        if env_id in ids:
+            mine.append(a)
+    if any(a["state"] != "approved" for a in mine):
+        return "not approved: the review history holds a %s entry for %s" % (
+            "/".join(sorted({a["state"] for a in mine if a["state"] != "approved"})), env_name)
+    if not mine:
+        return "not approved: no approval for environment %s (id %d) in run %s" % (env_name, env_id, rid)
+    if len(mine) > 1:
+        return "approval unverified: %d approval entries for %s in run %s" % (len(mine), env_name, rid)
+    user = mine[0]["user"]
+    want = _int(chan.get("approver_user_id"))
+    if want is None or _int(user.get("id")) != want:
+        return "not approved: the approval is by user id %r (%s), not the configured reviewer id %r" % (
+            user.get("id"), user.get("login"), chan.get("approver_user_id"))
+    record["approval"] = {"user_id": want, "login": user.get("login"), "environment_id": env_id,
+                          "sign_job_id": _int(sign.get("id")), "run_attempt": 1}
     return None
 
 
@@ -786,7 +932,38 @@ def check_channel(cfg, channel, run, now):
 
     # 2. compare with the recorded authorized release
     if rec is None or rec["sequence"] < live["sequence"]:
-        why = (corroborate_cli if kind == "cli" else corroborate_app)(cfg, chan, run, live)
+        cutoff = chan.get("approval_required_above_sequence")
+        if _int(cutoff) is None:
+            run.alert(channel + "/config-invalid", "approval_required_above_sequence is missing or not an integer")
+            return
+        above = live["sequence"] > cutoff
+        local_ack = None
+        if kind == "app" and not above:
+            why = corroborate_app(cfg, chan, run, live)          # pre-CI local provenance
+            live["provenance"] = "local (pre-CI)"
+        else:
+            try:
+                why = corroborate_signed_run(cfg, chan, run, live, require_approval=above)
+            except WatchError as exc:
+                # An API error or missing field is never approval.
+                why = "cannot verify the signed run%s: %s" % (" or its approval" if above else "", exc)
+            live["provenance"] = "ci, phone-approved" if above else "ci (pre-approval-gate)"
+            if why and kind == "app":
+                # Break-glass local publication: never CI-approved. Alert,
+                # unless the owner acknowledged exactly this envelope.
+                local_why = corroborate_app(cfg, chan, run, live)
+                acks = st.setdefault("local_acks", {}).get(channel, {})
+                if local_why is None and acks.get(live["tag"]) == live["envelope_sha256"]:
+                    local_ack = True
+                    live["provenance"] = "local provenance, not phone-approved CI (owner-acknowledged)"
+                    why = None
+                elif local_why is None:
+                    run.alert(channel + "/local-provenance",
+                              "%s (sequence %d) matches the local publication log but has no corroborated "
+                              "phone-approved CI run (%s) — LOCAL PROVENANCE, NOT PHONE-APPROVED CI; if this was "
+                              "the owner's break-glass release run `release_watch.py acknowledge-local %s %s %s`"
+                              % (tag, live["sequence"], why, channel, live["tag"], live["envelope_sha256"]))
+                    why = "local provenance, not phone-approved CI (unacknowledged)"
         if why:
             run.alert(channel + "/uncorroborated-release",
                       "%s (sequence %d) is live but NOT corroborated: %s — not recorded"
@@ -795,8 +972,10 @@ def check_channel(cfg, channel, run, now):
         else:
             st["recorded"][channel] = live
             st["full_hash_at"].pop(channel, None)   # force a full hash below
-            run.info("%s: %s (sequence %d, commit %s) corroborated and RECORDED as the authorized release"
-                     % (channel, tag, live["sequence"], tag_commit[:12]))
+            appr = live.get("approval")
+            run.info("%s: %s (sequence %d, commit %s) corroborated and RECORDED as the authorized release — %s%s"
+                     % (channel, tag, live["sequence"], tag_commit[:12], live["provenance"],
+                        (", approved by user id %d" % appr["user_id"]) if appr else ""))
             rec = live
     elif rec["sequence"] > live["sequence"]:
         pass   # already reported above
@@ -1012,6 +1191,22 @@ def cmd_check(cfg):
     return 2 if run.findings else 0
 
 
+def cmd_acknowledge_local(cfg, channel, tag, envelope_sha256):
+    """Owner act: accept ONE break-glass local release (exact tag + exact
+    envelope hash) as local provenance. It is recorded on the next check as
+    'local provenance, not phone-approved CI', never as CI-approved."""
+    if channel not in cfg["channels"] or not _RELEASE_TAG_RE.match(tag) \
+            or not re.fullmatch(r"[0-9a-f]{64}", envelope_sha256 or ""):
+        print("✖ usage: acknowledge-local <channel> <vX.Y.Z> <64-hex envelope sha256>")
+        return 2
+    with State(cfg["state_dir"]) as state:
+        state.data.setdefault("local_acks", {}).setdefault(channel, {})[tag] = envelope_sha256
+        state.save()
+    print("✔ %s %s (envelope %s…) acknowledged as LOCAL provenance — recorded as such on the next check"
+          % (channel, tag, envelope_sha256[:12]))
+    return 0
+
+
 def cmd_status(cfg):
     with State(cfg["state_dir"]) as state:
         print(json.dumps(state.data, indent=2, sort_keys=True))
@@ -1020,12 +1215,21 @@ def cmd_status(cfg):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["check", "status"])
+    ap.add_argument("command", choices=["check", "status", "acknowledge-local"])
+    ap.add_argument("args", nargs="*")
     ap.add_argument("--config", help="JSON config overriding DEFAULT_CONFIG")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     print("briglia release watch v%s — %s — %s" % (WATCH_VERSION, args.command, iso(now_ts())))
     try:
+        if args.command == "acknowledge-local":
+            if len(args.args) != 3:
+                print("✖ usage: acknowledge-local <channel> <vX.Y.Z> <envelope sha256>")
+                return 2
+            return cmd_acknowledge_local(cfg, *args.args)
+        if args.args:
+            print("✖ %s takes no arguments" % args.command)
+            return 2
         return {"check": cmd_check, "status": cmd_status}[args.command](cfg)
     except WatchError as exc:
         print("✖ %s" % exc)
