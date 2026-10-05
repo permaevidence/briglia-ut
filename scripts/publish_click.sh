@@ -2,6 +2,14 @@
 # Publish a built .click as an IMMUTABLE, SIGNED GitHub Release of
 # permaevidence/briglia-ut (docs: briglia-cli RELEASE_SIGNING_PLAN.md §9.3).
 #
+# TRANSITION (UT_SIGNING_IN_CI_PLAN.md): app releases move to
+# .github/workflows/release-signed.yml (one phone approval). This local
+# path stays only until the first CI release and the owner's restore
+# tests; its retirement commit removes the release path (break-glass:
+# scripts/release/breakglass-quiesce.py first, plan §10). The manifest
+# generator, supersession check, pre-publication gate and public
+# verification are the SAME scripts the workflow runs.
+#
 #   scripts/publish_click.sh [--dry-run] [--allow-dirty] [version]
 #
 # Flow (every step fails closed):
@@ -16,9 +24,14 @@
 #   4. manifest → sign with the LOCAL app key (never on argv, never printed)
 #      → verify with the committed public key AND with the app's own Python
 #      verifier (what the phone will run);
-#   5. draft release, assets, envelope last, atomic publish (immutable);
+#   5. pre-publication gate on the exact files handed to the publisher
+#      (scripts/release/prepublish-verify.py stage: envelope authenticated,
+#      version/sequence/URL/sha256/size checked, copies frozen read-only);
+#      draft release, assets, envelope last; the draft is READ BACK and
+#      compared byte for byte before the atomic publish (immutable);
 #   6. re-download the public envelope + click and require byte identity;
-#      require the release to be immutable and non-draft;
+#      require the release to be immutable and non-draft
+#      (scripts/release/verify-public-release.sh, shared with CI);
 #   7. record the publication (outside the repo) only after step 6.
 #
 # The pre-signature Vercel Blob layout (apps ≤ 0.7.3) was retired on
@@ -93,7 +106,7 @@ TITLE="Briglia for Ubuntu Touch"
 resolve_openssl || { echo "✖ no Ed25519-capable openssl (set OPENSSL_BIN)"; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 # --- keyId from the COMMITTED key; the private key is looked up by it.
 "$OPENSSL" pkey -pubin -in "$EXPECTED_PUB" -outform DER > "$WORK/pub.der"
@@ -109,38 +122,12 @@ SIGNING_KEY="${SIGNING_KEY:-$HOME/.briglia-release-keys/$KEYID.priv.pem}"
 PERM="$(python3 -c 'import os, sys; print("%o" % (os.stat(sys.argv[1]).st_mode & 0o777))' "$SIGNING_KEY")"
 [ "$PERM" = "600" ] || { echo "✖ signing key $SIGNING_KEY must be mode 0600 (is $PERM)"; exit 1; }
 
-# --- authenticated live-channel read: sets LIVE_STATUS, LIVE_SEQ,
-# LIVE_VER, LIVE_PAYLOAD (path). Anything served
-# that does not authenticate is a hard stop — never "absent".
-read_live() {
-    LIVE_STATUS="$(curl -sSL --max-filesize 131072 -o "$WORK/live.sig.json" -w '%{http_code}' "$LIVE_URL" 2>/dev/null || echo 000)"
-    LIVE_SEQ=""; LIVE_VER=""; LIVE_PAYLOAD="$WORK/live-payload.json"
-    case "$LIVE_STATUS" in
-        200)
-            "$RELEASE_SCRIPTS/verify-envelope.sh" "$WORK/live.sig.json" "$EXPECTED_PUB" "$CHANNEL" "$LIVE_PAYLOAD" >/dev/null 2>&1 || {
-                echo "✖ the LIVE envelope does not authenticate against the committed key — hard stop (never treated as absent)"; exit 1; }
-            LIVE_SEQ="$(python3 -c "import json;print(json.load(open('$LIVE_PAYLOAD'))['sequence'])")"
-            LIVE_VER="$(python3 -c "import json;print(json.load(open('$LIVE_PAYLOAD'))['version'])")"
-            [[ "$LIVE_SEQ" =~ ^[1-9][0-9]*$ ]] || { echo "✖ live sequence '$LIVE_SEQ' is not a positive integer"; exit 1; }
-            ;;
-        404)
-            # Fail closed forever: the signed app channel was bootstrapped
-            # once (v0.7.4) — a missing live envelope means an outage or a
-            # deleted release, and publishing waits; it never restarts from
-            # nothing (there is no --bootstrap any more).
-            echo "✖ no live signed release reachable at $LIVE_URL — refusing (bootstrap retired after v0.7.4; publishing never restarts from nothing)"; exit 1;;
-        *)  echo "✖ cannot read the live envelope (HTTP $LIVE_STATUS) — refusing to guess"; exit 1;;
-    esac
-}
-
 # Supersession gate for a candidate SEQUENCE (called twice: before the
-# build, and again right before the release is created).
+# build, and again right before the release is created). Shared with the
+# release-signed workflow: scripts/release/check-supersession.sh.
 check_supersession() {
-    local when="$1"
-    read_live
-    echo "  live ($when): v$LIVE_VER sequence $LIVE_SEQ"
-    [ "$SEQUENCE" -gt "$LIVE_SEQ" ] || {
-        echo "✖ superseded ($when): sequence $SEQUENCE is not greater than live $LIVE_SEQ — bump APP_RELEASE_SEQUENCE"; exit 1; }
+    SEQUENCE="$SEQUENCE" EXPECTED_PUB="$EXPECTED_PUB" LIVE_URL="$LIVE_URL" CHANNEL="$CHANNEL" WHEN="$1" \
+        "$RELEASE_SCRIPTS/check-supersession.sh"
 }
 
 # --- 1. source state
@@ -186,23 +173,8 @@ check_supersession "before build"
 # --- 4. manifest, signature, double verification
 DIST="$WORK/dist"; mkdir -p "$DIST"
 cp "$CLICK" "$DIST/$FILENAME"
-python3 - "$VERSION" "$SEQUENCE" "$DOWNLOAD_BASE/v$VERSION/$FILENAME" "$SHA256" "$SIZE" \
-    "${PUBLISHED_AT:-}" "${EXPIRES_DAYS:-180}" > "$DIST/manifest.json" <<'PYEOF'
-import datetime, json, sys
-version, sequence, url, sha, size, published_at, days = sys.argv[1:8]
-now = (datetime.datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-       if published_at else datetime.datetime.now(datetime.timezone.utc))
-fmt = "%Y-%m-%dT%H:%M:%SZ"
-print(json.dumps({
-    "channel": "briglia-ut",
-    "expires": (now + datetime.timedelta(days=int(days))).strftime(fmt),
-    "platforms": {"click": {"sha256": sha, "size": int(size), "url": url}},
-    "published": now.strftime(fmt),
-    "schema": 1,
-    "sequence": int(sequence),
-    "version": version,
-}, indent=2, sort_keys=True))
-PYEOF
+python3 "$RELEASE_SCRIPTS/build-manifest.py" "$VERSION" "$SEQUENCE" "$DOWNLOAD_BASE/v$VERSION/$FILENAME" "$SHA256" "$SIZE" \
+    "${PUBLISHED_AT:-}" "${EXPIRES_DAYS:-180}" > "$DIST/manifest.json"
 EXPECTED_PUBKEY_PEM="$EXPECTED_PUB" "$RELEASE_SCRIPTS/sign-envelope.sh" \
     "$SIGNING_KEY" "$CHANNEL" "$DIST/manifest.json" "$DIST/manifest.sig.json" >/dev/null
 "$RELEASE_SCRIPTS/verify-envelope.sh" "$DIST/manifest.sig.json" "$EXPECTED_PUB" "$CHANNEL" "$WORK/payload.json" >/dev/null
@@ -238,72 +210,33 @@ export GH_TOKEN
 # created: a concurrent or interleaved publisher that got ahead of us since
 # the first check must stop us here, never be "un-latested" by us.
 check_supersession "before publish"
+# Pre-publication gate on the exact files handed to the publisher: the
+# envelope is re-authenticated, its version/sequence/URL and the click's
+# sha256 + size are checked, and the verified copies are frozen read-only;
+# the publisher reads the draft back and compares before going live.
+STAGING="$WORK/staging"
+STAGED="$(python3 "$RELEASE_SCRIPTS/prepublish-verify.py" stage --dist "$DIST" --pub "$EXPECTED_PUB" \
+    --channel "$CHANNEL" --version "$VERSION" --sequence "$SEQUENCE" \
+    --url-prefix "$DOWNLOAD_BASE/v{version}/" --expect-file "$FILENAME" --out "$STAGING")" || {
+    echo "✖ pre-publication staging gate refused — nothing created"; exit 1; }
 RELEASE_ID_OUT="$WORK/release-id" \
-ASSETS="$DIST/$FILENAME
-$DIST/manifest.json
-$DIST/manifest.sig.json" \
+ASSETS="$STAGED" \
+PREPUBLISH_VERIFY="$RELEASE_SCRIPTS/prepublish-verify.py" PREPUBLISH_STAGING="$STAGING" \
+EXPECTED_PUB="$EXPECTED_PUB" CHANNEL="$CHANNEL" \
 REPO="$REPO" REF_NAME="$TAG" VERSION="$VERSION" TITLE="$TITLE" TARGET_COMMITISH="$HEAD_SHA" \
 GH_API_URL="$API" GH_UPLOADS_URL="$UPLOADS" \
     "$RELEASE_SCRIPTS/publish-github-release.sh"
 RELEASE_ID="$(cat "$WORK/release-id")"
 
-# --- 6. re-verify the PUBLIC state, byte for byte. GitHub's `latest`
-# pointer lags a just-published release by up to a couple of minutes
-# (measured in the Stage-7 rehearsal, 2026-09-01: the release was live and
-# immutable while latest/download still served the previous envelope). An
-# AUTHENTICATED previous state — the release we just superseded — means
-# "not yet", and we wait, bounded. Anything else served is a hard stop, never waited out; and
-# a hard stop here leaves the release live but NOT recorded, so the message
-# says so.
-fetch_public() {  # url out
-    local url="$1" out="$2" attempt status
-    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        status="$(curl -sSL --max-filesize 33554432 -o "$out" -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
-        [ "$status" = "200" ] && return 0
-        sleep "${PUBLIC_RETRY_SLEEP:-5}"
-    done
-    echo "✖ public fetch of $url failed (last HTTP $status)"; return 1
-}
-PROPAGATION_ATTEMPTS="${PUBLIC_PROPAGATION_ATTEMPTS:-60}"   # × PUBLIC_RETRY_SLEEP (5s) = 5 minutes
-attempt=0
-while :; do
-    fetch_public "$LIVE_URL" "$WORK/public.sig.json"
-    cmp -s "$WORK/public.sig.json" "$DIST/manifest.sig.json" && break
-    if "$RELEASE_SCRIPTS/verify-envelope.sh" "$WORK/public.sig.json" "$EXPECTED_PUB" "$CHANNEL" "$WORK/public-payload.json" >/dev/null 2>&1; then
-        PUB_SEQ="$(python3 -c "import json;print(json.load(open('$WORK/public-payload.json'))['sequence'])")"
-        PUB_VER="$(python3 -c "import json;print(json.load(open('$WORK/public-payload.json'))['version'])")"
-        [[ "$PUB_SEQ" =~ ^[1-9][0-9]*$ ]] && [ "$PUB_SEQ" -lt "$SEQUENCE" ] || {
-            echo "✖ the public LATEST envelope authenticates but is NOT this release (v$PUB_VER sequence $PUB_SEQ; ours v$VERSION sequence $SEQUENCE) — a sibling publication got ahead; release $RELEASE_ID is live but NOT recorded; investigate before anything else"; exit 1; }
-        WHAT="the previous release (authenticated v$PUB_VER, sequence $PUB_SEQ)"
-    else
-        echo "✖ the public LATEST envelope is neither this release nor an authenticated previous state — release $RELEASE_ID is live but NOT recorded; investigate before anything else"; exit 1
-    fi
-    attempt=$((attempt + 1))
-    [ "$attempt" -lt "$PROPAGATION_ATTEMPTS" ] || {
-        echo "✖ the public LATEST still serves $WHAT after $PROPAGATION_ATTEMPTS attempts — release $RELEASE_ID ($TAG) is live and immutable but NOT recorded; once https://github.com/$REPO/releases/latest points at $TAG, re-verify and record it by hand (RELEASE_RUNBOOKS.md)"; exit 1; }
-    echo "  …latest still serves $WHAT — waiting for GitHub's latest pointer (attempt $attempt)"
-    sleep "${PUBLIC_RETRY_SLEEP:-5}"
-done
-fetch_public "$DOWNLOAD_BASE/v$VERSION/$FILENAME" "$WORK/public.click"
-cmp -s "$WORK/public.click" "$CLICK" || { echo "✖ the public click differs from the built one"; exit 1; }
-REL_STATUS="$(curl -sS -o "$WORK/rel.json" -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
-    -H "Accept: application/vnd.github+json" "$API/repos/$REPO/releases/tags/$TAG" 2>/dev/null || echo 000)"
-[ "$REL_STATUS" = "200" ] || { echo "✖ cannot read the published release (HTTP $REL_STATUS)"; exit 1; }
-python3 - "$WORK/rel.json" "$RELEASE_ID" <<'PYEOF'
-import json, sys
-rel = json.load(open(sys.argv[1]))
-assert str(rel.get("id")) == sys.argv[2], "release id mismatch"
-assert rel.get("draft") is False, "release is still a draft"
-assert rel.get("immutable") is True, "release is NOT immutable — enable immutable releases on the repository"
-PYEOF
-# Independent tag binding check before anything is recorded: the published
-# tag, resolved through the refs API (never the release's target_commitish
-# echo), must name the reviewed HEAD.
-TAG_COMMIT="$(GH_API_URL="$API" "$RELEASE_SCRIPTS/resolve-tag-commit.sh" "$REPO" "$TAG")" || {
-    echo "✖ cannot resolve refs/tags/$TAG after publication — NOT recorded; investigate"; exit 1; }
-[ "$TAG_COMMIT" = "$HEAD_SHA" ] || {
-    echo "✖ refs/tags/$TAG names commit $TAG_COMMIT, not the reviewed HEAD $HEAD_SHA — the published release is bound to the wrong commit; NOT recorded; investigate before anything else"; exit 1; }
-echo "✔ public state verified: $TAG immutable, tag → ${HEAD_SHA:0:12}, envelope + click byte-identical"
+# --- 6. re-verify the PUBLIC state, byte for byte (shared with the
+# workflow's verify-production job): latest authenticated first, bounded
+# wait while it still serves the authenticated previous release, envelope +
+# click identity, non-draft + immutable, refs/tags → HEAD. A hard stop here
+# leaves the release live but NOT recorded.
+REPO="$REPO" VERSION="$VERSION" SEQUENCE="$SEQUENCE" EXPECTED_PUB="$EXPECTED_PUB" CHANNEL="$CHANNEL" \
+CANDIDATE_ENVELOPE="$DIST/manifest.sig.json" CANDIDATE_CLICK="$CLICK" EXPECTED_COMMIT="$HEAD_SHA" \
+RELEASE_ID="$RELEASE_ID" GH_API_URL="$API" LIVE_ENVELOPE_URL="$LIVE_URL" PUBLIC_DOWNLOAD_BASE="$DOWNLOAD_BASE" \
+    "$RELEASE_SCRIPTS/verify-public-release.sh"
 
 # --- 7. record (outside the repository) only after verification
 mkdir -p "$(dirname "$LOG")"

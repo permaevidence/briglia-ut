@@ -61,6 +61,9 @@ class FakeGitHub:
         self.tags = {}
         self.tag_objects = {}
         self.ref_lookups = 0
+        self.asset_gets = []      # asset ids downloaded through the API (pre-go-live gate)
+        self.token_leaked = False  # Authorization reached the storage host
+        self._asset_seq = 5000
         gh = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -85,11 +88,26 @@ class FakeGitHub:
             def _auth(self):
                 return self.headers.get("Authorization") == "Bearer t0k"
 
+            def _assets_json(self, r):
+                out = []
+                for n in r["order"] if r.get("order") else r["assets"]:
+                    if n not in r["assets"]:
+                        continue
+                    body = r["assets"][n]
+                    a = {"id": r.setdefault("asset_ids", {}).setdefault(n, gh.next_asset_id()), "name": n,
+                         "size": len(body), "state": "uploaded"}
+                    if gh.faults.get("asset_digest", True):
+                        a["digest"] = "sha256:" + hashlib.sha256(body).hexdigest()
+                    if gh.faults.get("asset_size_lie") == n:
+                        a["size"] = len(body) + 1
+                    out.append(a)
+                return out
+
             def _rel_json(self, r):
                 return {"id": r["id"], "tag_name": r["tag_name"], "draft": r["draft"],
                         "name": r["name"], "immutable": r["immutable"],
                         "target_commitish": r.get("target_commitish"),
-                        "assets": [{"name": n} for n in r["assets"]]}
+                        "assets": self._assets_json(r)}
 
             def do_GET(self):
                 gh.hits.append(("GET", self.path))
@@ -107,6 +125,42 @@ class FakeGitHub:
                 if m:
                     r = gh.releases.get(int(m.group(2)))
                     return self._json(200, self._rel_json(r)) if r else self._json(404, {})
+                m = re.match(r"^/api/repos/([^/]+/[^/]+)/releases/(\d+)/assets$", path)
+                if m:
+                    if not self._auth():
+                        return self._json(401, {"message": "bad token"})
+                    r = gh.releases.get(int(m.group(2)))
+                    if r is None:
+                        return self._json(404, {})
+                    page = int(urllib.parse.parse_qs(parsed.query).get("page", ["1"])[0])
+                    items = self._assets_json(r) if page == 1 else []
+                    if gh.faults.get("asset_list_extra") and page == 1:
+                        items.append({"id": 99999, "name": gh.faults["asset_list_extra"], "size": 1, "state": "uploaded"})
+                    return self._json(200, items)
+                m = re.match(r"^/api/repos/([^/]+/[^/]+)/releases/assets/(\d+)$", path)
+                if m:
+                    # Like GitHub: the API answers a redirect to a storage host,
+                    # which must NOT receive the token.
+                    if not self._auth() or self.headers.get("Accept") != "application/octet-stream":
+                        return self._json(401 if not self._auth() else 415, {"message": "bad request"})
+                    gh.asset_gets.append(int(m.group(2)))
+                    self.send_response(302)
+                    # another HOST name for the same server: curl must drop the token
+                    self.send_header("Location", "http://localhost:%d/blob/%s" % (gh.server.server_address[1], m.group(2)))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                m = re.match(r"^/blob/(\d+)$", path)
+                if m:
+                    if self.headers.get("Authorization"):
+                        gh.token_leaked = True
+                    for r in gh.releases.values():
+                        for n, aid in r.get("asset_ids", {}).items():
+                            if aid == int(m.group(1)) and n in r["assets"]:
+                                body = r["assets"][n]
+                                sub = gh.faults.get("blob_substitute", {})
+                                return self._send(200, sub.get(n, body), "application/octet-stream")
+                    return self._send(404, b"")
                 m = re.match(r"^/api/repos/([^/]+/[^/]+)/git/ref/tags/([^/]+)$", path)
                 if m:
                     if not self._auth():
@@ -178,6 +232,8 @@ class FakeGitHub:
                         return self._json(422, {"message": "not a draft"})
                     if gh.faults.get("upload_fail") == name:
                         return self._json(500, {"message": "injected upload failure"})
+                    if gh.faults.get("upload_corrupt") == name:
+                        body = bytes([body[0] ^ 1]) + body[1:]   # storage-side damage / wrong artifact
                     r["assets"][name] = body
                     r["order"].append(name)
                     return self._json(201, {"name": name})
@@ -217,6 +273,10 @@ class FakeGitHub:
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def next_asset_id(self):
+        self._asset_seq += 1
+        return self._asset_seq
 
     def latest(self):
         published = [r for r in self.releases.values() if not r["draft"]]
@@ -504,6 +564,68 @@ def main():
         check("release not immutable → exit 1, NOT recorded",
               rc != 0 and "NOT immutable" in out and len(log_lines()) == before, out)
         del gh.faults["immutable"]
+
+        print("— pre-go-live gate: the draft is read back before the PATCH (plan §3.2) —")
+        click12 = "briglia.permaevidence_0.7.12_all.click"
+
+        def patched(tag):
+            r = gh.by_tag(tag)
+            return r is not None and ("PATCH", "/api/repos/test/briglia-ut/releases/%d" % r["id"]) in gh.hits
+
+        def refused_before_patch(rc, out, tag, before):
+            r = gh.by_tag(tag)
+            return (rc != 0 and "pre-publication verification of draft" in out and r is not None and r["draft"]
+                    and not patched(tag) and gh.latest()["tag_name"] == "v0.7.11" and len(log_lines()) == before)
+        stamp(9, "0.7.12")
+        before = len(log_lines())
+        gh.faults["upload_corrupt"] = click12
+        rc, out = run()
+        check("uploaded click differs by one byte from the verified one → gate refuses, NO PATCH, draft stays, old latest, nothing recorded",
+              refused_before_patch(rc, out, "v0.7.12", before) and "API digest" in out, out)
+        gh.faults["asset_digest"] = False
+        rc, out = run()
+        check("…and with no API digest the downloaded BYTES still catch it (digest is never a substitute)",
+              refused_before_patch(rc, out, "v0.7.12", before) and "uploaded bytes differ" in out, out)
+        del gh.faults["asset_digest"]
+        del gh.faults["upload_corrupt"]
+        gh.faults["asset_list_extra"] = "evil.sh"
+        rc, out = run()
+        check("draft holds an EXTRA asset → refused before the PATCH", refused_before_patch(rc, out, "v0.7.12", before)
+              and "not exactly the staged set" in out, out)
+        del gh.faults["asset_list_extra"]
+        swapped = key.sign(json.dumps({"channel": "briglia-ut", "expires": "2099-01-01T00:00:00Z",
+                                       "platforms": {"click": {"sha256": "ab" * 32, "size": 1,
+                                                               "url": gh.base + "/download/v0.7.12/" + click12}},
+                                       "published": "2026-01-01T00:00:00Z", "schema": 1,
+                                       "sequence": 99, "version": "0.7.12"}, sort_keys=True, indent=2).encode())
+        gh.faults["blob_substitute"] = {"manifest.sig.json": swapped}
+        rc, out = run()
+        check("draft envelope swapped for ANOTHER authenticated envelope (sequence 99) → refused before the PATCH",
+              refused_before_patch(rc, out, "v0.7.12", before), out)
+        del gh.faults["blob_substitute"]
+        gh.faults["asset_size_lie"] = "manifest.json"
+        rc, out = run()
+        check("API reports a size different from the staged file → refused before the PATCH",
+              refused_before_patch(rc, out, "v0.7.12", before) and "API size" in out, out)
+        del gh.faults["asset_size_lie"]
+        gh.faults["asset_digest"] = False
+        gh.asset_gets.clear()
+        rc, out = run()
+        rel12 = gh.by_tag("v0.7.12")
+        patch_at = gh.hits.index(("PATCH", "/api/repos/test/briglia-ut/releases/%d" % rel12["id"])) if rel12 else -1
+        gets_at = [i for i, h in enumerate(gh.hits) if h[0] == "GET" and re.match(r"^/api/repos/test/briglia-ut/releases/assets/\d+$", h[1])]
+        check("no API digest (optional field) but bytes verified → publishes; stale draft from the refusals cleaned first",
+              rc == 0 and rel12 and rel12["draft"] is False and len([r for r in gh.releases.values() if r["tag_name"] == "v0.7.12"]) == 1, out)
+        check("the gate downloaded all 3 draft assets BEFORE the go-live PATCH",
+              len(gh.asset_gets) == 3 and gets_at and max(gets_at) < patch_at, (gets_at, patch_at))
+        check("the token never reached the asset storage host", gh.token_leaked is False)
+        del gh.faults["asset_digest"]
+        p = subprocess.run([os.path.join(repo_src, "scripts", "release", "publish-github-release.sh")], capture_output=True, text=True,
+                           env={**os.environ, "GH_TOKEN": "t0k", "REPO": "test/briglia-ut", "REF_NAME": "v9.9.8", "VERSION": "9.9.8",
+                                "TITLE": "t", "ASSETS": os.path.join(repo, "manifest.json"), "GH_API_URL": gh.base + "/api",
+                                "TARGET_COMMITISH": "a" * 40})
+        check("publish-github-release.sh without PREPUBLISH_VERIFY refuses before any API call",
+              p.returncode != 0 and "PREPUBLISH_VERIFY is required" in p.stdout + p.stderr, p.stdout + p.stderr)
 
         print("— tag binding (refs API, not target_commitish) —")
         by_tag_log = {json.loads(l)["tag"]: json.loads(l)["commit"] for l in log_lines()}

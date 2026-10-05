@@ -11,6 +11,13 @@
 #                 must be the signed envelope manifest.sig.json),
 #                 TARGET_COMMITISH (the exact reviewed commit SHA the tag
 #                 must name)
+#                 PREPUBLISH_VERIFY (MANDATORY pre-go-live gate: an executable
+#                 run as `$PREPUBLISH_VERIFY draft <release-id>` after every
+#                 upload and before the go-live PATCH, with this script's
+#                 environment; it must read the draft's assets back and prove
+#                 they are the verified bytes — scripts/release/prepublish-verify.py.
+#                 Unset, not executable, failed or inconclusive → no PATCH,
+#                 the draft stays unpublished, exit 1)
 # Env (optional): GH_API_URL (default https://api.github.com),
 #                 GH_UPLOADS_URL (default https://uploads.github.com)
 #
@@ -36,6 +43,8 @@ set -euo pipefail
 : "${ASSETS:?ASSETS is required}"
 : "${TARGET_COMMITISH:?TARGET_COMMITISH is required (the reviewed commit SHA the tag must name)}"
 [[ "$TARGET_COMMITISH" =~ ^[0-9a-f]{40}$ ]] || { echo "✖ TARGET_COMMITISH must be a full 40-hex commit SHA, not a branch name"; exit 1; }
+: "${PREPUBLISH_VERIFY:?PREPUBLISH_VERIFY is required (the pre-go-live draft read-back gate)}"
+[ -x "$PREPUBLISH_VERIFY" ] || { echo "✖ PREPUBLISH_VERIFY ($PREPUBLISH_VERIFY) is not executable — refusing to publish without the pre-go-live gate"; exit 1; }
 API="${GH_API_URL:-https://api.github.com}"
 UPLOADS="${GH_UPLOADS_URL:-https://uploads.github.com}"
 RESOLVE_TAG="$(dirname "$0")/resolve-tag-commit.sh"
@@ -141,6 +150,15 @@ while IFS= read -r asset; do
     [ -n "$asset" ] || continue
     upload "$asset"
 done <<< "$ASSETS"
+
+# 4b. Pre-go-live gate (mandatory): read the draft back by id and prove its
+#     asset set and every asset's bytes are exactly the verified inputs, and
+#     that its envelope authenticates. Anything else → no PATCH.
+export GH_TOKEN REPO REF_NAME GH_API_URL="$API"
+if ! "$PREPUBLISH_VERIFY" draft "$RELEASE_ID"; then
+    echo "✖ pre-publication verification of draft $RELEASE_ID FAILED — NOT published; the draft stays unpublished (removed by the next run), the old release stays latest"
+    exit 1
+fi
 
 # 5. Last look at the tag (it is created by THIS publish if absent; if it
 #    appeared meanwhile it must already be ours), then atomic go-live;

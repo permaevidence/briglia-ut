@@ -86,9 +86,10 @@ def main():
           and "permaevidence_${VERSION}" not in publisher)
     check("publisher title/channel are Briglia's",
           'CHANNEL="briglia-ut"' in publisher and 'TITLE="Briglia for Ubuntu Touch"' in publisher)
-    check("publisher: --bootstrap retired (absent live envelope is a refusal)",
-          "--bootstrap)" not in publisher and "BOOTSTRAP" not in publisher
-          and "bootstrap retired" in publisher)
+    supersession = read("scripts/release/check-supersession.sh")
+    check("publisher: --bootstrap retired (absent live envelope is a refusal, in the shared supersession check)",
+          "--bootstrap)" not in publisher and "BOOTSTRAP" not in publisher and "BOOTSTRAP" not in supersession
+          and "check-supersession.sh" in publisher and "bootstrap retired" in supersession)
     check("publisher: the rename-transition descriptor is gone (post-transition)",
           "LEGACY_" not in publisher and "legacy envelope" not in publisher.lower())
     check("app cache/state paths follow the package id",
@@ -318,8 +319,11 @@ def main():
           chans["briglia-cli"]["repo"] == "permaevidence/briglia-cli" and chans["briglia-ut"]["repo"] == "permaevidence/briglia-ut"
           and chans["briglia-cli"]["installer_source"] == "scripts/get-briglia.sh"
           and chans["briglia-ut"]["publication_log"] == "~/.briglia-release-keys/briglia-ut-publications.jsonl"
-          and chans["briglia-cli"]["website_install_url"] == briglia_bridge.WEBSITE_BASE + "/install.sh"
-          and chans["briglia-ut"]["website_page_url"] == briglia_bridge.WEBSITE_BASE + "/ubuntu-touch", chans)
+          # since 9ff2316 every website check probes the alias AND briglia.dev
+          and briglia_bridge.WEBSITE_BASE + "/install.sh" in chans["briglia-cli"]["website_install_url"]
+          and "https://briglia.dev/install.sh" in chans["briglia-cli"]["website_install_url"]
+          and briglia_bridge.WEBSITE_BASE + "/ubuntu-touch" in chans["briglia-ut"]["website_page_url"]
+          and "https://briglia.dev/ubuntu-touch" in chans["briglia-ut"]["website_page_url"], chans)
     check("watcher + heartbeat: one state directory, the new one",
           release_watch.DEFAULT_CONFIG["state_dir"] == "~/.config/briglia-release-watch"
           and release_heartbeat.DEFAULTS["state_dir"] == release_watch.DEFAULT_CONFIG["state_dir"])
