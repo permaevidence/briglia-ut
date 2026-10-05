@@ -1,0 +1,326 @@
+name: Release (signed)
+
+# The app channel's signed release pipeline (briglia-cli-private-docs
+# UT_SIGNING_IN_CI_PLAN.md §3.1), a mirror of briglia-cli's:
+# authorize → build on Linux + rebuild on macOS (byte-identical, hard gate)
+# → assemble manifest → sign (release-sign environment: ONE phone approval,
+# attempt 1 only) → verify candidate (credential-free) → publish one
+# immutable GitHub Release (draft, envelope last, the draft read back and
+# compared before the atomic go-live) → verify through the public path.
+#
+# Runs only where the release channel is armed (repository variable
+# RELEASE_CHANNEL_ENABLED=true: the public repo, and a rehearsal repo).
+# The private repo never sets it.
+#
+# Secret separation: only `sign` sees the key (and only after approval);
+# only `publish` has contents:write; every verify job holds neither.
+# Context values reach shells only through env:.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+# One publication at a time, never cancelled mid-publish: a stale run is
+# stopped by the supersession re-check, not by a cancel that could
+# interrupt a half-assembled draft.
+concurrency:
+  group: briglia-ut-release-signed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_PUB: .release-keys/briglia-ut-release.pub.pem
+  CHANNEL: briglia-ut
+
+jobs:
+  authorize:
+    name: Authorize (credential-free)
+    if: vars.RELEASE_CHANNEL_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.gate.outputs.version }}
+      sequence: ${{ steps.gate.outputs.sequence }}
+      filename: ${{ steps.gate.outputs.filename }}
+      url_prefix: ${{ steps.gate.outputs.url_prefix }}
+      live_url: ${{ steps.gate.outputs.live_url }}
+      live_version: ${{ steps.gate.outputs.live_version }}
+      live_sequence: ${{ steps.gate.outputs.live_sequence }}
+      live_commit: ${{ steps.gate.outputs.live_commit }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - name: Gate checks
+        id: gate
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$REF_TYPE" = "tag" ] || { echo "✖ not a tag push"; exit 1; }
+          printf '%s' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "✖ tag '$REF_NAME' is not exact SemVer"; exit 1; }
+          VERSION="${REF_NAME#v}"
+          # The tagged commit must be reachable from protected main.
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "✖ tagged commit is not on protected main"; exit 1; }
+          MANIFEST_VERSION="$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")"
+          [ "$MANIFEST_VERSION" = "$VERSION" ] || {
+            echo "✖ manifest.json version $MANIFEST_VERSION != tag $REF_NAME"; exit 1; }
+          SEQUENCE="$(grep -E '^APP_RELEASE_SEQUENCE = [0-9]+$' py/release_verify.py | grep -oE '[0-9]+')"
+          [[ "$SEQUENCE" =~ ^[1-9][0-9]*$ ]] || { echo "✖ APP_RELEASE_SEQUENCE not found"; exit 1; }
+          [ -f "$EXPECTED_PUB" ] || { echo "✖ committed expected public key missing"; exit 1; }
+          . scripts/release/openssl-resolve.sh
+          resolve_openssl
+          FP="$("$OPENSSL" pkey -pubin -in "$EXPECTED_PUB" -outform DER | tail -c 32 | "$OPENSSL" dgst -sha256 -hex | awk '{print $NF}')"
+          KEYID="$CHANNEL-release-v1-${FP:0:16}"
+          grep -q "\"$KEYID\"" py/release_verify.py || {
+            echo "✖ py/release_verify.py does not pin $KEYID — the app would refuse its own update"; exit 1; }
+          # The phone's own policy decides where it looks; it must name THIS repository.
+          read -r LIVE_URL URL_PREFIX < <(python3 -c 'import sys; sys.path.insert(0, "py"); import release_verify as rv
+          print(rv.APP_POLICY.envelope_url, rv.APP_POLICY.artifact_url_prefix)')
+          [ "$LIVE_URL" = "https://github.com/$REPO/releases/latest/download/manifest.sig.json" ] || {
+            echo "✖ APP_POLICY envelope URL $LIVE_URL does not name $REPO"; exit 1; }
+          [ "$URL_PREFIX" = "https://github.com/$REPO/releases/download/v{version}/" ] || {
+            echo "✖ APP_POLICY artifact prefix $URL_PREFIX does not name $REPO"; exit 1; }
+          PKG="$(python3 -c "import json;print(json.load(open('manifest.json'))['name'])")"
+          # Supersession against the AUTHENTICATED live channel (no bootstrap).
+          SEQUENCE="$SEQUENCE" LIVE_URL="$LIVE_URL" WHEN="authorize" LIVE_OUT="$GITHUB_OUTPUT" \
+            ./scripts/release/check-supersession.sh
+          # The live release's tag, resolved to a commit through the refs API
+          # (verify-candidate compares the shipped verifier with that commit).
+          LIVE_VERSION="$(grep '^live_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+          LIVE_COMMIT="$(./scripts/release/resolve-tag-commit.sh "$REPO" "v$LIVE_VERSION")"
+          [[ "$LIVE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "✖ cannot resolve the live tag v$LIVE_VERSION to a commit"; exit 1; }
+          {
+            echo "version=$VERSION"
+            echo "sequence=$SEQUENCE"
+            echo "filename=${PKG}_${VERSION}_all.click"
+            echo "url_prefix=$URL_PREFIX"
+            echo "live_url=$LIVE_URL"
+            echo "live_commit=$LIVE_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+          echo "authorized v$VERSION sequence $SEQUENCE over live v$LIVE_VERSION (${LIVE_COMMIT:0:12})"
+
+  build:
+    name: Build click (Linux)
+    needs: authorize
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Build (deterministic)
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -c 'import zlib; print("zlib", zlib.ZLIB_VERSION, "runtime", zlib.ZLIB_RUNTIME_VERSION)'
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+          python3 scripts/build_click.py dist
+          shasum -a 256 dist/*.click
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: click-linux
+          path: dist/*.click
+
+  build-repro:
+    name: Build click (macOS, reproducibility)
+    needs: authorize
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Rebuild (deterministic)
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -c 'import zlib; print("zlib", zlib.ZLIB_VERSION, "runtime", zlib.ZLIB_RUNTIME_VERSION)'
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+          python3 scripts/build_click.py dist
+          shasum -a 256 dist/*.click
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: click-macos
+          path: dist/*.click
+
+  assemble:
+    name: Assemble manifest
+    needs: [authorize, build, build-repro]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: click-linux
+          path: linux
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: click-macos
+          path: macos
+      - name: Reproducibility gate, then the manifest
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          FILENAME: ${{ needs.authorize.outputs.filename }}
+          URL_PREFIX: ${{ needs.authorize.outputs.url_prefix }}
+        run: |
+          set -euo pipefail
+          [ -f "linux/$FILENAME" ] && [ -f "macos/$FILENAME" ] || { echo "✖ a build did not produce $FILENAME"; exit 1; }
+          # HARD GATE: two independent builds must be byte-identical. A
+          # mismatch stops the release for investigation; it is never a warning.
+          cmp -s "linux/$FILENAME" "macos/$FILENAME" || {
+            shasum -a 256 "linux/$FILENAME" "macos/$FILENAME"
+            echo "✖ the Linux and macOS builds differ — reproducibility gate failed; investigate before releasing"; exit 1; }
+          mkdir -p dist
+          cp "linux/$FILENAME" "dist/$FILENAME"
+          SHA256="$(shasum -a 256 "dist/$FILENAME" | awk '{print $1}')"
+          SIZE="$(wc -c < "dist/$FILENAME" | tr -d ' ')"
+          URL="${URL_PREFIX/\{version\}/$VERSION}$FILENAME"
+          python3 scripts/release/build-manifest.py "$VERSION" "$SEQUENCE" "$URL" "$SHA256" "$SIZE" > dist/manifest.json
+          cat dist/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: candidate
+          path: dist/
+
+  sign:
+    name: Sign metadata
+    needs: [authorize, assemble]
+    runs-on: ubuntu-latest
+    environment: release-sign
+    steps:
+      - name: One signing execution per run (attempt 1 only)
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # The single phone approval binds to the single signing execution
+          # of this run; a re-run that would sign again must be a new
+          # version/run instead (plan §3.3). Publish-only retries reuse the
+          # signed bytes and never reach this job.
+          [ "$RUN_ATTEMPT" = "1" ] || {
+            echo "✖ run attempt $RUN_ATTEMPT: signing happens only in attempt 1 — cut a new version instead of re-running signing"; exit 1; }
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: candidate
+          path: dist
+      - name: Sign the manifest
+        env:
+          SIGNING_KEY_B64: ${{ secrets.BRIGLIA_UT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$SIGNING_KEY_B64" ] || { echo "✖ BRIGLIA_UT_SIGNING_KEY is not configured"; exit 1; }
+          KEYFILE="$(mktemp)"
+          chmod 600 "$KEYFILE"
+          trap 'rm -f "$KEYFILE"' EXIT
+          printf '%s' "$SIGNING_KEY_B64" | base64 -d > "$KEYFILE"
+          EXPECTED_PUBKEY_PEM="$EXPECTED_PUB" \
+            ./scripts/release/sign-envelope.sh "$KEYFILE" "$CHANNEL" dist/manifest.json dist/manifest.sig.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: envelope
+          path: dist/manifest.sig.json
+
+  verify-candidate:
+    name: Verify candidate
+    needs: [authorize, sign]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: candidate
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: envelope
+          path: dist
+      - name: Candidate, live and pinned verifiers; app identity; hashes
+        env:
+          VERSION: ${{ needs.authorize.outputs.version }}
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          FILENAME: ${{ needs.authorize.outputs.filename }}
+          LIVE_URL: ${{ needs.authorize.outputs.live_url }}
+          LIVE_COMMIT: ${{ needs.authorize.outputs.live_commit }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/verify-candidate.py --click "dist/$FILENAME" --manifest dist/manifest.json \
+            --envelope dist/manifest.sig.json --pub "$EXPECTED_PUB" --channel "$CHANNEL" \
+            --version "$VERSION" --sequence "$SEQUENCE" --live-commit "$LIVE_COMMIT" \
+            --live-envelope-url "$LIVE_URL" --fixture scripts/fixtures/release_verify_0.8.5.py \
+            --fixture-sha256 "$(cat scripts/fixtures/release_verify_0.8.5.py.sha256)"
+
+  publish:
+    name: Publish immutable release
+    needs: [authorize, verify-candidate]
+    runs-on: ubuntu-latest
+    environment: release-publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: candidate
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: envelope
+          path: dist
+      - name: Re-check supersession inside the publish lock
+        env:
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          LIVE_URL: ${{ needs.authorize.outputs.live_url }}
+        run: WHEN="before publish" ./scripts/release/check-supersession.sh
+      - name: Pre-publication gate on these inputs, then draft → read back → go live
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          FILENAME: ${{ needs.authorize.outputs.filename }}
+          URL_PREFIX: ${{ needs.authorize.outputs.url_prefix }}
+        run: |
+          set -euo pipefail
+          STAGING="$RUNNER_TEMP/staging"
+          ASSETS="$(python3 scripts/release/prepublish-verify.py stage --dist dist --pub "$EXPECTED_PUB" \
+            --channel "$CHANNEL" --version "$VERSION" --sequence "$SEQUENCE" --url-prefix "$URL_PREFIX" \
+            --expect-file "$FILENAME" --out "$STAGING")"
+          ASSETS="$ASSETS" PREPUBLISH_VERIFY=scripts/release/prepublish-verify.py PREPUBLISH_STAGING="$STAGING" \
+          TITLE="Briglia for Ubuntu Touch" TARGET_COMMITISH="$GITHUB_SHA" \
+            ./scripts/release/publish-github-release.sh
+
+  verify-production:
+    name: Verify public channel
+    needs: [authorize, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: candidate
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: envelope
+          path: dist
+      - name: Authenticate latest first, then byte identity, immutability, tag binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.authorize.outputs.version }}
+          SEQUENCE: ${{ needs.authorize.outputs.sequence }}
+          FILENAME: ${{ needs.authorize.outputs.filename }}
+          LIVE_URL: ${{ needs.authorize.outputs.live_url }}
+        run: |
+          set -euo pipefail
+          CANDIDATE_ENVELOPE=dist/manifest.sig.json CANDIDATE_CLICK="dist/$FILENAME" EXPECTED_COMMIT="$GITHUB_SHA" \
+          LIVE_ENVELOPE_URL="$LIVE_URL" ./scripts/release/verify-public-release.sh

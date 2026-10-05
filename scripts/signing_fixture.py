@@ -221,3 +221,28 @@ class FakeHost:
     def close(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+PRODUCTION_RELEASES_BASE = "https://github.com/permaevidence/briglia-ut/releases"
+
+
+def stamp_app_policy(source, key_id, pub_hex, releases_base=None, sequence=None):
+    """Return py/release_verify.py text with the APP key replaced by a test
+    key and (optionally) the app channel's release location moved from the
+    production repository to `releases_base` (…/releases) and the build's
+    own APP_RELEASE_SEQUENCE set. The same edit the rehearsal-stamping
+    commit makes (scripts/rehearsal/stamp.py); production files are never
+    touched by it."""
+    import re
+    s = re.sub(r"# STAMP-APP-KEY-BEGIN.*?# STAMP-APP-KEY-END",
+               '# STAMP-APP-KEY-BEGIN\nAPP_KEYS = {\n    "%s":\n        "%s",\n}\n# STAMP-APP-KEY-END'
+               % (key_id, pub_hex), source, flags=re.S)
+    if releases_base:
+        if PRODUCTION_RELEASES_BASE not in s:
+            raise ValueError("production release location not found — refusing to stamp blindly")
+        s = s.replace(PRODUCTION_RELEASES_BASE, releases_base)
+    if sequence is not None:
+        s, n = re.subn(r"^APP_RELEASE_SEQUENCE = \d+$", "APP_RELEASE_SEQUENCE = %d" % sequence, s, flags=re.M)
+        if n != 1:
+            raise ValueError("APP_RELEASE_SEQUENCE not found exactly once")
+    return s

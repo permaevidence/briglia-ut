@@ -41,12 +41,16 @@ jobs:
         run: python3 scripts/release_selftest.py
       - name: Publisher (fake GitHub API, legacy transition)
         run: python3 scripts/publish_selftest.py
+      - name: Signed-release CI pieces (candidate verifier, staging gate, workflow static checks, break-glass quiesce)
+        run: python3 scripts/ci_release_selftest.py
       - name: Click packaging
         run: python3 scripts/click_selftest.py
       - name: Chat client + QML sweep
         run: python3 scripts/chat_selftest.py
       - name: Release watcher + heartbeat (+ launchd installer on macOS)
         run: python3 scripts/watch_selftest.py
+      - name: Release watcher — signed-run corroboration + approval evidence (both channels)
+        run: python3 scripts/watch_approval_selftest.py
       - name: Release-key directory rename (Stage 8 helper)
         run: python3 scripts/keys_rename_selftest.py
       - name: QR decoder + generator cross-check (vendored scripts/fixtures/qrlib.mjs)

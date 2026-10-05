@@ -1,0 +1,15 @@
+{
+  "channel": "briglia-ut",
+  "expires": "2027-03-05T20:30:49Z",
+  "platforms": {
+    "click": {
+      "sha256": "1717cb79d7ff42c0ee8b8df4955a6dd2b8d64f377e74081ac7851e73bcfc2654",
+      "size": 224090,
+      "url": "https://github.com/permaevidence/briglia-ut/releases/download/v0.8.5/briglia.permaevidence_0.8.5_all.click"
+    }
+  },
+  "published": "2026-09-06T20:30:49Z",
+  "schema": 1,
+  "sequence": 7,
+  "version": "0.8.5"
+}
