@@ -52,6 +52,8 @@ class Fake:
         self.site_installer = None  # bytes served by /site/cli/install.sh (None → redirect to release asset)
         self.site_installer_redirect = None
         self.site_page = b""
+        self.domain_installer = None   # bytes served by /domain/cli/install.sh (None → same as the site)
+        self.domain_page = None        # bytes served by /domain/app (None → same as the site)
         self.legacy_manifest = None
         self.telegram = []         # captured message texts
         self.faults = {}           # range_total: int | None; asset_404: name; asset_sub: {name: bytes};
@@ -121,6 +123,16 @@ class Fake:
                     return self._send(404)
                 if p == "/site/app":
                     return self._send(200, fake.site_page, "text/html")
+                # the "real domain" (briglia.dev) — same deployment as the
+                # alias unless a test hijacks it independently
+                if p == "/domain/cli/install.sh":
+                    if fake.domain_installer is not None:
+                        return self._send(200, fake.domain_installer)
+                    self.path = "/site/cli/install.sh"
+                    return self.do_GET()
+                if p == "/domain/app":
+                    page = fake.site_page if fake.domain_page is None else fake.domain_page
+                    return self._send(200, page, "text/html")
                 if p == "/legacy/manifest.json":
                     if fake.legacy_manifest is None:
                         return self._send(404)
@@ -213,12 +225,12 @@ def main():
         "channels": {
             "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "workflow_name": "Release (signed)",
                         "installer_asset": "install.sh", "installer_source": "scripts/get-briglia.sh",
-                        "website_install_url": B + "/site/cli/install.sh",
+                        "website_install_url": [B + "/site/cli/install.sh", B + "/domain/cli/install.sh"],
                         "envelope_url": B + "/latest/briglia-cli/manifest.sig.json",
                         "artifact_url_prefix": B + "/download/briglia-cli/v{version}/",
                         "legacy_blob_manifest": None},
             "briglia-ut": {"kind": "app", "repo": "test/briglia-ut", "publication_log": pub_log,
-                       "website_page_url": B + "/site/app",
+                       "website_page_url": [B + "/site/app", B + "/domain/app"],
                        "envelope_url": B + "/latest/briglia-ut/manifest.sig.json",
                        "artifact_url_prefix": B + "/download/briglia-ut/v{version}/",
                        "legacy_blob_manifest": B + "/legacy/manifest.json"},
@@ -295,7 +307,12 @@ def main():
         check("full hash performed on first record", set(st["full_hash_at"]) == {"briglia-cli", "briglia-ut"}
               and "full download of every asset matches" in out, out)
         check("installer identity + website resolution + page link + legacy manifest all verified",
-              all(x in out for x in ("byte-identical", "website install URL resolves", "website page links", "legacy transition manifest agrees")), out)
+              all(x in out for x in ("byte-identical", "legacy transition manifest agrees",
+                                     "website install URL %s/site/cli/install.sh resolves" % B,
+                                     "website install URL %s/domain/cli/install.sh resolves" % B,
+                                     "website page %s/site/app links" % B, "website page %s/domain/app links" % B)), out)
+        check("every published release checked: immutable + v<semver> tags (clean)",
+              "published release(s) are immutable with v<semver> tags" in out, out)
         fake.telegram.clear()
         rc, out = run()
         check("second identical run is SILENT (no messages) and skips the daily full hash",
@@ -393,9 +410,42 @@ def main():
         rc, out = run()
         check("latest release not immutable → alert", rc == 2 and any("not-immutable" in m for m in fake.telegram), fake.telegram)
         fake.releases["test/briglia-cli"][-1]["immutable"] = True; run(); fake.telegram.clear()
-        fake.faults["api_status"] = 503
+        # R4.3: rogue releases outside the v* pipeline, and any mutable release
+        fake.releases["test/briglia-cli"].insert(0, {"id": 1, "tag_name": "x", "draft": False, "immutable": True})
         rc, out = run()
-        check("GitHub API unreachable → alert, never silent", rc == 2 and any("github-unreachable" in m for m in fake.telegram), fake.telegram)
+        check("an OLDER published release on a non-v<semver> tag ('x') → release-bad-tag alert, exit 2",
+              rc == 2 and any("release-bad-tag" in m and ": x" in m for m in fake.telegram)
+              and not any("latest-mismatch" in m for m in fake.telegram), fake.telegram)
+        fake.releases["test/briglia-cli"].pop(0); fake.telegram.clear(); rc, out = run()
+        check("…recovery once the rogue release is gone", rc == 0 and len(fake.telegram) == 1
+              and "recovered: briglia-cli/release-bad-tag" in fake.telegram[0], fake.telegram)
+        fake.telegram.clear()
+        fake.releases["test/briglia-cli"].append({"id": 1098, "tag_name": "v0.1.59-hotfix", "draft": False, "immutable": True})
+        rc, out = run()
+        check("a rogue release on a v-prefixed but non-semver tag MARKED LATEST → release-bad-tag AND latest-mismatch",
+              rc == 2 and any("release-bad-tag" in m and "v0.1.59-hotfix" in m for m in fake.telegram)
+              and any("latest-mismatch" in m for m in fake.telegram), fake.telegram)
+        fake.releases["test/briglia-cli"].pop(); run(); fake.telegram.clear()
+        fake.releases["test/briglia-cli"][0]["immutable"] = False
+        rc, out = run()
+        check("an OLDER (non-latest) published release that is not immutable → release-not-immutable alert naming it",
+              rc == 2 and any("release-not-immutable" in m and "v0.1.58" in m for m in fake.telegram)
+              and not any("/not-immutable" in m for m in fake.telegram), fake.telegram)
+        fake.releases["test/briglia-cli"][0]["immutable"] = True; run(); fake.telegram.clear()
+        fake.releases["test/briglia-cli"].insert(0, {"id": 2, "tag_name": "scratch", "draft": True, "immutable": False})
+        rc, out = run()
+        check("a DRAFT on an odd tag (never immutable) → informational only, no tag/immutability alert",
+              rc == 0 and not any("release-bad-tag" in m or "release-not-immutable" in m for m in fake.telegram)
+              and any("draft release(s) present: scratch" in m for m in fake.telegram), fake.telegram)
+        fake.releases["test/briglia-cli"].pop(0); run(); fake.telegram.clear()
+        fake.faults["api_status"] = 503
+        # network-class: retried in-run and announced only after
+        # transient_grace_checks (default 3) consecutive failing checks
+        run(); run()
+        quiet = not any("github-unreachable" in m for m in fake.telegram)
+        rc, out = run()
+        check("GitHub API unreachable → silent for the first 2 checks, alert on the 3rd (never silent for long)",
+              quiet and rc == 2 and any("github-unreachable" in m for m in fake.telegram), fake.telegram)
         del fake.faults["api_status"]; run(); fake.telegram.clear()
 
         print("— assets —")
@@ -434,6 +484,24 @@ def main():
         check("app page not linking the released click → website-page alert",
               rc == 2 and any("website-page" in m for m in fake.telegram), fake.telegram)
         fake.site_page = ("<a href=\"%s/download/briglia-ut/v0.7.4/click\">x</a>" % B).encode(); run(); fake.telegram.clear()
+        # R6: the real domain is probed too, so a domain-only hijack shows
+        fake.domain_installer = b"#!/bin/bash\necho hijacked domain\n"
+        rc, out = run()
+        check("real domain serving different installer bytes while the Vercel alias is fine → website-installer alert naming the domain",
+              rc == 2 and any("website-installer" in m and "/domain/cli/install.sh" in m and "/site/cli/install.sh" not in m
+                              for m in fake.telegram), fake.telegram)
+        fake.domain_installer = None; run(); fake.telegram.clear()
+        fake.domain_page = b"<html>hijacked</html>"
+        rc, out = run()
+        check("real domain page not linking the released click while the alias does → website-page alert naming the domain",
+              rc == 2 and any("website-page" in m and "/domain/app" in m and "/site/app " not in m for m in fake.telegram), fake.telegram)
+        fake.domain_page = None; run(); fake.telegram.clear()
+        good_page = fake.site_page
+        fake.site_page = b"<html>stale ISR copy</html>"
+        rc, out = run()
+        check("both hostnames stale at once (the ISR-lag case) → ONE website-page message, not one per hostname",
+              rc == 2 and sum("website-page" in m for m in fake.telegram) == 1, fake.telegram)
+        fake.site_page = good_page; run(); fake.telegram.clear()
         fake.legacy_manifest = {"version": "0.7.3", "sha256": "00" * 32}
         rc, out = run()
         check("legacy Blob manifest disagreeing with the authoritative release → legacy-blob alert",

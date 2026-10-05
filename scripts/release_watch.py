@@ -30,16 +30,20 @@ Per channel, `check`:
   3. asks the GitHub API: the latest release must be non-draft, immutable,
      carry the manifest's tag, and refs/tags/<tag> must still resolve to the
      recorded commit; no non-draft release may carry a higher version than
-     `latest` (a confused/frozen latest pointer);
+     `latest` (a confused/frozen latest pointer); EVERY non-draft release
+     must be immutable and tagged v<major>.<minor>.<patch> (a release on any
+     other tag was not made by the pipeline, yet could be marked latest);
   4. every asset in the manifest must be reachable at its immutable URL
      with the authenticated size (Range probe, hourly); once a day, or
      whenever the recorded release changes, every asset is downloaded in
      full with the size bound and its SHA-256 compared;
   5. CLI only: the released install.sh must be byte-identical to
      scripts/get-briglia.sh at the exact release tag;
-  6. optional website checks: the CLI install command must resolve (via
-     redirect) to the released installer bytes; the app page must link the
-     exact click URL from the app manifest;
+  6. optional website checks, on EVERY configured hostname (the Vercel alias
+     and the real domain briglia.dev, so a domain/DNS-only hijack is seen):
+     the CLI install command must resolve (via redirect) to the released
+     installer bytes; the app page must link the exact click URL from the
+     app manifest;
   7. optional transition check: a legacy Blob manifest still in service must
      agree with the authoritative release;
   8. metadata expiry within the warning window is an alert.
@@ -121,20 +125,40 @@ DEFAULT_CONFIG = {
             "workflow_name": "Release (signed)",
             "installer_asset": "install.sh",
             "installer_source": "scripts/get-briglia.sh",
-            "website_install_url": "https://briglia.vercel.app/install.sh",
+            # Every URL is probed: the Vercel project alias AND the real
+            # domain, so a DNS/domain-only hijack of briglia.dev alerts too.
+            # A single string is still accepted (older configs).
+            "website_install_url": ["https://briglia.vercel.app/install.sh",
+                                    "https://briglia.dev/install.sh"],
             "legacy_blob_manifest": None,
         },
         "briglia-ut": {
             "kind": "app",
             "repo": "permaevidence/briglia-ut",
             "publication_log": "~/.briglia-release-keys/briglia-ut-publications.jsonl",
-            "website_page_url": "https://briglia.vercel.app/ubuntu-touch",
+            "website_page_url": ["https://briglia.vercel.app/ubuntu-touch",
+                                 "https://briglia.dev/ubuntu-touch"],
             "legacy_blob_manifest": None,
         },
     },
 }
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# The only tag shape the release pipeline ever publishes. Anything else on a
+# non-draft release is a release created outside the pipeline (the v* tag
+# ruleset does not cover it, yet it can be marked latest).
+_RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+
+
+def url_list(value):
+    """A config URL field: None/"" → [], a string → [it], a list → itself."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(u, str) and u for u in value):
+        return list(dict.fromkeys(value))
+    raise WatchError("URL config value must be a string or a list of strings, got %r" % (value,))
 
 
 # ------------------------------------------------------------------ utils
@@ -776,6 +800,22 @@ def check_channel(cfg, channel, run, now):
     drafts = [r["tag_name"] for r in releases if r.get("draft")]
     if drafts:
         run.info("%s: draft release(s) present: %s" % (channel, ", ".join(drafts)))
+    # Every published (non-draft) release — not just latest — must carry a
+    # pipeline-shaped v<semver> tag and be immutable. Drafts are never
+    # immutable and are reported above.
+    published = [r for r in releases if not r.get("draft")]
+    bad_tags = [str(r.get("tag_name")) for r in published
+                if not isinstance(r.get("tag_name"), str) or not _RELEASE_TAG_RE.match(r["tag_name"])]
+    if bad_tags:
+        run.alert(channel + "/release-bad-tag",
+                  "published release(s) whose tag is not v<major>.<minor>.<patch> — not made by the release "
+                  "pipeline: %s" % ", ".join(sorted(bad_tags)))
+    mutable = [str(r.get("tag_name")) for r in published if r.get("immutable") is not True]
+    if mutable:
+        run.alert(channel + "/release-not-immutable",
+                  "published release(s) that are NOT immutable: %s" % ", ".join(sorted(mutable)))
+    if releases and not bad_tags and not mutable:
+        run.ok("all %d published release(s) are immutable with v<semver> tags" % len(published))
 
     # 4. assets: probe hourly, full hash daily / after change
     problems = []
@@ -826,32 +866,47 @@ def check_channel(cfg, channel, run, now):
                           "released %s differs from %s at %s" % (chan["installer_asset"], chan["installer_source"], tag))
             else:
                 run.ok("released installer is byte-identical to %s@%s" % (chan["installer_source"], tag))
-                if chan.get("website_install_url"):
-                    s3, _, via_site = fetch(chan["website_install_url"])
+                site_bad = []
+                for site_url in url_list(chan.get("website_install_url")):
+                    s3, _, via_site = fetch(site_url)
                     if s3 != 200 or via_site != released:
-                        run.alert(channel + "/website-installer",
-                                  "%s does not resolve to the released installer (HTTP %s)" % (chan["website_install_url"], s3))
+                        site_bad.append("%s (HTTP %s)" % (site_url, s3))
                     else:
-                        run.ok("website install URL resolves to the released installer")
+                        run.ok("website install URL %s resolves to the released installer" % site_url)
+                if site_bad:
+                    run.alert(channel + "/website-installer",
+                              "does not resolve to the released installer: " + "; ".join(site_bad))
         except Exception as exc:  # noqa: BLE001
             run.alert(channel + "/installer", "installer check failed: %s" % exc,
                       transient=is_network_error(exc))
 
-    # 6. website page must link the exact asset (app)
-    if chan.get("website_page_url"):
+    # 6. website page must link the exact asset (app). One finding key for
+    # all page URLs, so the known ISR lag right after an app release (the
+    # page is revalidated on a visit, ~300 s) still produces ONE alert, as
+    # before, rather than one per hostname.
+    try:
+        page_urls = url_list(chan.get("website_page_url"))
+    except WatchError as exc:
+        run.alert(channel + "/config-invalid", str(exc))
+        page_urls = []
+    page_bad, page_net = [], True
+    for page_url in page_urls:
         try:
-            s, _, page = fetch(chan["website_page_url"], max_bytes=MAX_PAGE_FETCH)
+            s, _, page = fetch(page_url, max_bytes=MAX_PAGE_FETCH)
             urls = [a["url"] for a in live["assets"].values()]
             if s != 200:
-                run.alert(channel + "/website-page", "%s → HTTP %s" % (chan["website_page_url"], s))
+                page_bad.append("%s → HTTP %s" % (page_url, s))
+                page_net = False
             elif not all(u.encode() in page for u in urls):
-                run.alert(channel + "/website-page", "%s does not link the released asset(s) %s"
-                          % (chan["website_page_url"], ", ".join(urls)))
+                page_bad.append("%s does not link the released asset(s) %s" % (page_url, ", ".join(urls)))
+                page_net = False
             else:
-                run.ok("website page links the released asset")
+                run.ok("website page %s links the released asset" % page_url)
         except Exception as exc:  # noqa: BLE001
-            run.alert(channel + "/website-page", "page check failed: %s" % exc,
-                      transient=is_network_error(exc))
+            page_bad.append("%s: page check failed: %s" % (page_url, exc))
+            page_net = page_net and is_network_error(exc)
+    if page_bad:
+        run.alert(channel + "/website-page", "; ".join(page_bad), transient=page_net)
 
     # 7. transition: a legacy manifest still in service must agree
     if chan.get("legacy_blob_manifest"):
