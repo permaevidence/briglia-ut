@@ -498,6 +498,10 @@ def daily(cfg, cfg_problem, now=None):
             if not bl.get("complete"):
                 level = max(level, 1)
                 lines.append("%s: legacy signing baseline still being recorded" % c)
+        if b.get("held"):
+            level = max(level, 1)
+            lines.append("Unverified, not yet alerts (they alert if still open after the freshness limit): "
+                         + ", ".join(b["held"]))
         if b.get("pending_confirm"):
             lines.append("Release(s) seen, ✅ not yet sent: " + ", ".join(b["pending_confirm"]))
         ro = b.get("report_only_open") or []

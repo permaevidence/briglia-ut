@@ -127,7 +127,7 @@ def main():
         "heartbeat_max_age_hours": 2.25,
         "coverage_limits_hours": {"hourly": 2.25, "env-publish": 8.25, "asset-hash": 26, "deletion": 26},
         "site_beacon_max_minutes": 20, "check_minute": 23, "transient_grace_checks": 3,
-        "signing_audit_alerts": True, "audit_report_since": None,
+        "signing_audit_alerts": True, "audit_report_since": None, "retry_delay_seconds": 0.2,
         "channels": {
             "briglia-cli": {"repo": CLI, "envelope_url": B + "/latest/briglia-cli/manifest.sig.json",
                             "artifact_url_prefix": B + "/download/briglia-cli/v{version}/",
@@ -640,7 +640,7 @@ def main():
               "check, not a binding)", not tg("deploy-unexplained"), fake.telegram)
         fake.deployments[CLI].append(dict(d1, id=6900000104, created_at="2026-10-08T15:00:00Z"))
         fake.dep_statuses[(CLI, 6900000104)] = [{"state": "inactive", "target_url": "https://github.com/%s/actions/runs/%d/job/1"
-                                                 % (UT, APP_RUN), "log_url": ""}]
+                                                 % (CLI, PIN_RUN), "log_url": ""}]
         fake.telegram.clear()
         run()
         check("a third deployment whose forged status points at an approved run ELSEWHERE → still unexplained AND a "
@@ -814,8 +814,42 @@ def main():
         run()
         fake.telegram.clear()
 
+        # ------------------------------------------------- unverified hold (anti-noise)
+        print("— unverified states folded until the freshness limit (owner anti-noise rule) —")
+        write_cfg(unverified_hold_hours=2.25)
+        held_run = run_obj(CLI, 37910000001, "v0.2.47", S47, CLI_WF, "2026-10-09T02:00:00Z",
+                           full_jobs(CLI_JOB_NAMES, 9200, "2026-10-09T02:05:00Z", "2026-10-09T02:05:06Z", "GitHub Actions 9200"),
+                           approvals_by_attempt={"1": []})
+        fake.runs[CLI].append(held_run)
+        fake.telegram.clear()
+        run()
+        st_ = state()
+        check("an UNVERIFIED signing state is held (no Telegram message), listed for the daily status",
+              not tg("signing/37910000001") and st_["active"]["briglia-cli/signing/37910000001"].get("held")
+              and "briglia-cli/signing/37910000001" in json.load(open(os.path.join(sd, "check.beacon.json")))["held"], fake.telegram)
+        set_state(lambda st: st["active"]["briglia-cli/signing/37910000001"].__setitem__("first", time.time() - 2.3 * 3600))
+        run()
+        check("…still open beyond the freshness limit → alerts ONCE", len(tg("signing/37910000001")) == 1, fake.telegram)
+        run()
+        check("…not repeated", len(tg("signing/37910000001")) == 1, fake.telegram)
+        fake.runs[CLI].remove(held_run)
+        scrub("37910000001")
+        write_cfg()
+        fake.telegram.clear()
+
         # ------------------------------------------------- budget
         print("— budget guard (60/hour per IP) —")
+        run()
+        set_state(lambda st: st.__setitem__("active", {}))
+        run()
+        clean_before = state().get("last_clean")
+        fake.rate = {"remaining": 14, "limit": 60, "reset": time.time() + 3000}
+        rc, out = run()
+        st_ = state()
+        check("a run left partial by the budget (no finding at all) never advances last_clean",
+              clean_before and st_.get("last_clean") == clean_before and not st_["active"]
+              and json.load(open(os.path.join(sd, "check.beacon.json")))["partial"], (clean_before, st_.get("last_clean"),
+                                                                                    list(st_["active"])))
         fake.rate = {"remaining": 12, "limit": 60, "reset": time.time() + 3000}
         set_state(lambda st: st["coverage"].__setitem__("briglia-cli/events", time.time() - 3 * 3600))
         fake.telegram.clear()
@@ -1375,8 +1409,8 @@ exit 0
         open(bad, "wb").write(bytes(data))
         open(launch_log, "w").close()
         rc, out = install(troot, ["", "yes"], bundle_path=bad)
-        check("tampered bundle → refused before anything changes (no launchctl call)", rc == 1 and "sha256" in out
-              and not launch_calls(), out[-500:])
+        check("tampered bundle → refused before anything changes (no launchctl call)", rc == 1
+              and "but this installer embeds" in out and not launch_calls(), out[-500:])
         # downgrade
         subprocess.run([sys.executable, os.path.join(scripts, "sentinel", "build_bundle.py"), dist + "old", "--version", "0.8.0"],
                        capture_output=True)

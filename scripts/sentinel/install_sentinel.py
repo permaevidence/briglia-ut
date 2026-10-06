@@ -12,6 +12,8 @@ Other commands (same file, same sudo):
     … install_sentinel.py --audit-alerts on     # end the report-only period (explicit, never automatic)
     … install_sentinel.py --deadman-url URL     # optional outside dead-man ping (e.g. healthchecks.io); "off" removes it
     … install_sentinel.py --uninstall [--remove-state] [--remove-user]
+    … install_sentinel.py --bundle-file PATH    # use a local copy of the bundle (still checked
+                                                # against the sha256 embedded below)
 
 What it does:
   * downloads the bundle briglia-sentinel-<version>.pyz from the SAME
@@ -168,14 +170,15 @@ def vtuple(v):
 
 def fetch_bundle(host):
     if host.bundle_file:
-        data = open(host.bundle_file, "rb").read()
+        with open(host.bundle_file, "rb") as f:
+            data = f.read(MAX_BUNDLE + 1)
     else:
         url = RELEASE_BASE + BUNDLE_NAME
         req = urllib.request.Request(url, headers={"User-Agent": "briglia-sentinel-installer/" + VERSION})
         with urllib.request.urlopen(req, timeout=120) as resp:
             data = resp.read(MAX_BUNDLE + 1)
-        if len(data) > MAX_BUNDLE:
-            raise Refuse("the bundle is larger than %d bytes — refusing" % MAX_BUNDLE)
+    if len(data) > MAX_BUNDLE:
+        raise Refuse("the bundle is larger than %d bytes — refusing" % MAX_BUNDLE)
     got = hashlib.sha256(data).hexdigest()
     if got != BUNDLE_SHA256:
         raise Refuse("the downloaded bundle's sha256 is %s, but this installer embeds %s — refusing (nothing installed)"
@@ -315,6 +318,7 @@ def make_config(host, old):
         "checker_website": False,
         "realert_hours": 0,
         "realert_on_change": False,
+        "unverified_hold_hours": 2.25,
         "heartbeat_max_age_hours": 2.25,
         "coverage_limits_hours": {"hourly": 2.25, "env-publish": 8.25, "asset-hash": 26, "deletion": 26},
         "site_beacon_max_minutes": 20,
@@ -608,6 +612,7 @@ def main(argv=None):
     ap.add_argument("--remove-user", action="store_true")
     ap.add_argument("--audit-alerts", choices=["on", "off"])
     ap.add_argument("--deadman-url")
+    ap.add_argument("--bundle-file", help="local copy of the bundle; verified against the embedded sha256 like a download")
     # selftest only (refused as root)
     ap.add_argument("--test-root", help=argparse.SUPPRESS)
     ap.add_argument("--test-bin", help=argparse.SUPPRESS)
@@ -616,7 +621,7 @@ def main(argv=None):
     ap.add_argument("--test-config", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     try:
-        host = Host(a.test_root, a.test_bin, a.test_bundle, a.test_telegram_api,
+        host = Host(a.test_root, a.test_bin, a.test_bundle or a.bundle_file, a.test_telegram_api,
                     json.loads(a.test_config) if a.test_config else None)
         if not host.test and os.geteuid() != 0:
             raise Refuse("run it with sudo: sudo /usr/bin/python3 -I %s" % os.path.abspath(sys.argv[0]))

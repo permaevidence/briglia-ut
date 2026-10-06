@@ -51,6 +51,8 @@ jobs:
         run: python3 scripts/watch_selftest.py
       - name: Release watcher — signed-run corroboration + approval evidence (both channels)
         run: python3 scripts/watch_approval_selftest.py
+      - name: Sentinel — audits, remote mode, website job, confirmations, heartbeat/daily, installer
+        run: python3 scripts/sentinel_selftest.py
       - name: Release-key directory rename (Stage 8 helper)
         run: python3 scripts/keys_rename_selftest.py
       - name: QR decoder + generator cross-check (vendored scripts/fixtures/qrlib.mjs)
@@ -61,10 +63,15 @@ jobs:
   # selftests above already run on both OSes.
   release-breaks:
     runs-on: ubuntu-24.04
-    # Each watcher break re-runs the full watch selftest (~5 min); with the
-    # coverage breaks the job takes ~55 min, so allow 120.
+    # Each watcher/Sentinel break re-runs a whole suite (about 1 min each with
+    # the shortened in-run retry pause); four shards keep every job well
+    # under its limit.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["0/4", "1/4", "2/4", "3/4"]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Release-tooling deliberate breaks (each must turn its suite red)
-        run: python3 scripts/ci_release_breaks.py
+        run: python3 scripts/ci_release_breaks.py --shard "${{ matrix.shard }}"
