@@ -170,11 +170,19 @@ def is_network(exc):
 
 def probe_installer(url, redirect, want):
     """→ (problem kind, text, fetched sha256 or None). kind ∈ ok | redirect |
-    content | uncached | network."""
+    content | uncached | network | network-body.
+
+    What each kind ESTABLISHES (check_site judges only that):
+      ok            redirect correct, bytes verified
+      redirect      first hop wrong (or unreadable) — content NOT checked
+      uncached      redirect correct, nothing cached to compare — content NOT checked
+      network       first hop unreachable — neither redirect nor content checked
+      network-body  redirect correct, the bytes behind it unreachable — content NOT checked
+      content       redirect correct, bytes WRONG"""
     try:
         status, loc = first_hop(url)
     except Exception as exc:  # noqa: BLE001
-        return ("network" if is_network(exc) else "content"), "%s: %s" % (url, exc), None
+        return ("network" if is_network(exc) else "redirect"), "%s: %s" % (url, exc), None
     if status >= 500 or status == 429:
         return "network", "%s → HTTP %s" % (url, status), None
     if status not in (301, 302, 303, 307, 308) or loc != redirect:
@@ -184,9 +192,9 @@ def probe_installer(url, redirect, want):
     try:
         s2, body = fetch(redirect)
     except Exception as exc:  # noqa: BLE001
-        return ("network" if is_network(exc) else "content"), "%s: %s" % (redirect, exc), None
+        return ("network-body" if is_network(exc) else "content"), "%s: %s" % (redirect, exc), None
     if s2 >= 500 or s2 == 429:
-        return "network", "%s → HTTP %s" % (redirect, s2), None
+        return "network-body", "%s → HTTP %s" % (redirect, s2), None
     got = hashlib.sha256(body).hexdigest()
     if s2 != 200 or got != want["sha256"] or len(body) != want["size"]:
         return "content", ("%s serves an installer (HTTP %s, sha256 %s…, %d bytes) that is NOT the verified one "
@@ -290,46 +298,68 @@ def send_telegram(cfg, text):
 
 # ----------------------------------------------------------------------- run
 
+# What a probe kind establishes about the redirect / the content (see probe_installer).
+_REDIRECT_KNOWN = {"ok", "redirect", "uncached", "network-body", "content"}
+_CONTENT_KNOWN = {"ok", "content"}
+
+
 def check_site(cfg, cache, st, now):
-    """→ (findings {key: (text, network?)}, judged keys, transitions)."""
+    """→ (findings {key: (text, network?)}, judged keys).
+
+    A key is judged — and so may be cleared with a "recovered" message —
+    only when THIS run established every predicate its finding is about, for
+    every URL of the channel: site-redirect needs every first hop answered;
+    site-content needs every installer's bytes / every page actually fetched
+    and compared. A valid redirect never proves the content; an unreachable
+    first hop proves neither. Adverse findings found are always reported. A
+    held transition closes only when the content was verified on every URL."""
     findings, judged = {}, set()
     trans = st.setdefault("transitions", {})
     content = cache["content"]
     minute = content.get("check_minute", cfg["check_minute"])
     for channel, entry in sorted(content["channels"].items()):
-        problems = []          # (kind, text, fetched digest)
+        problems = []          # (kind, text, fetched digest[, page bytes])
+        redirect_known = content_known = True
         if entry.get("website_install_url"):
             for url in entry["website_install_url"]:
                 kind, text, got = probe_installer(url, entry.get("redirect"), entry.get("installer"))
+                redirect_known = redirect_known and kind in _REDIRECT_KNOWN
+                content_known = content_known and kind in _CONTENT_KNOWN
                 if kind != "ok":
-                    problems.append((kind, text, got))
+                    problems.append(("network" if kind == "network-body" else kind, text, got))
                 else:
                     print("  ✔ %s serves the verified installer" % url)
         if entry.get("website_page_url"):
             for url in entry["website_page_url"]:
                 kind, text, page = probe_page(url, entry.get("click_urls"))
+                content_known = content_known and kind in _CONTENT_KNOWN
                 if kind != "ok":
                     problems.append((kind, text, hashlib.sha256(page).hexdigest() if page else None, page))
                 else:
                     print("  ✔ %s links the verified click" % url)
         rkey, ckey, nkey, ukey = (channel + "/site-redirect", channel + "/site-content", channel + "/site-unreachable",
                                   channel + "/site-uncached")
-        judged.update((rkey, ckey, nkey, ukey))
         redirect = [p for p in problems if p[0] == "redirect"]
         contentp = [p for p in problems if p[0] == "content"]
         network = [p for p in problems if p[0] == "network"]
         uncached = [p for p in problems if p[0] == "uncached"]
+        judged.add(nkey)                   # every host answered ⇔ no network finding
+        if redirect_known:
+            judged.add(rkey)
+        if content_known:
+            judged.add(ckey)
+        if entry.get("installer") or not entry.get("website_install_url"):
+            judged.add(ukey)               # a cached installer disproves 'uncached' by itself
         if redirect:                       # always checked independently, never excused
             findings[rkey] = ("; ".join(p[1] for p in redirect), False)
         if network:
             findings[nkey] = ("; ".join(p[1] for p in network), True)
-            judged.discard(ckey)           # content not judged while a host is unreachable
         if uncached:
             findings[ukey] = (uncached[0][1], True)
         if not contentp:
-            if not network:
-                trans.pop(channel, None)   # content verified: any transition closes, quietly
-            continue
+            if content_known:
+                trans.pop(channel, None)   # content verified on EVERY URL: any transition closes, quietly
+            continue                       # otherwise a held transition keeps its fixed deadline
         cand = candidate(entry, now)
         excusable = False
         if cand is not None and entry.get("kind") == "app":

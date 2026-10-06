@@ -111,11 +111,17 @@ def check_env_rules(api, cfg, channel, chan, run):
     want_reviewer = _int(chan.get("approver_user_id"))
     key, drift_key = channel + "/env-rules", channel + "/env-drift"
     env = api.get("/repos/%s/environments/%s" % (repo, env_name), priority=1, allow_404=True)
-    run.judged(key, drift_key)
     if env is None:
+        run.judged(key, drift_key)
         run.alert(key, "environment %s does not exist (confirmed 404) — the signing gate is gone" % env_name)
         return
+    # A key is judged only once ALL the evidence that could disprove its
+    # finding is in: the branch-policy request comes after the environment,
+    # so a failure there leaves env-rules unjudged (kept, no recovery) while
+    # any weakening already established still alerts.
     problems, drift = [], []
+    drift_complete = False
+    deferred = None
     try:
         if not isinstance(env, dict):
             raise ValueError("environment answer is not an object")
@@ -130,6 +136,7 @@ def check_env_rules(api, cfg, channel, chan, run):
         extra = sorted({str(t) for t in types} - EXPECTED_SIGN_RULES)
         if extra:
             drift.append("unexpected protection rule type(s) %s (configuration drift)" % ", ".join(extra))
+        drift_complete = True
         rev = [r for r in rules if r.get("type") == "required_reviewers"]
         if len(rev) != 1:
             problems.append("%d required_reviewers rule(s), expected exactly 1" % len(rev))
@@ -146,15 +153,27 @@ def check_env_rules(api, cfg, channel, chan, run):
         if dbp != {"protected_branches": False, "custom_branch_policies": True}:
             problems.append("deployment_branch_policy is %r, expected custom policies only" % (dbp,))
         else:
-            pols, _ = _branch_policies(api, repo, env_name, 1)
-            if pols != {("v*", "tag")}:
-                problems.append("branch policies are %s, expected exactly (v*, tag)" % sorted(pols, key=str))
+            try:
+                pols, _ = _branch_policies(api, repo, env_name, 1)
+            except ValueError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — budget/network: not checked; re-raised below
+                deferred = exc
+            else:
+                if pols != {("v*", "tag")}:
+                    problems.append("branch policies are %s, expected exactly (v*, tag)" % sorted(pols, key=str))
     except ValueError as exc:
         problems.append("unreadable answer: %s" % exc)
     if problems:
         run.alert(key, "%s on %s is WEAKER than pinned: %s" % (env_name, repo, "; ".join(problems)))
+    elif deferred is None:
+        run.judged(key)
     if drift:
         run.alert(drift_key, "%s on %s: %s — reported as drift, not as a weakening" % (env_name, repo, "; ".join(drift)))
+    elif drift_complete:
+        run.judged(drift_key)
+    if deferred is not None:
+        raise deferred
     if not problems and not drift:
         run.ok("%s rules match the pinned expectation (env id, one reviewer id, no bypass, self-review blocked, v* tags)" % env_name)
 
@@ -166,8 +185,8 @@ def check_env_publish(api, cfg, channel, chan, run):
     want_id = _int((chan.get("environment_ids") or {}).get("release-publish"))
     env = api.get("/repos/%s/environments/release-publish" % repo, priority=7, allow_404=True)
     rulesets = api.get("/repos/%s/rulesets" % repo, {"per_page": 100}, priority=7)
-    run.judged(key, rs_key)
     problems = []
+    deferred = None
     if env is None:
         problems.append("environment release-publish does not exist (confirmed 404)")
     else:
@@ -182,18 +201,32 @@ def check_env_publish(api, cfg, channel, chan, run):
             if env.get("deployment_branch_policy") != {"protected_branches": False, "custom_branch_policies": True}:
                 problems.append("deployment_branch_policy is %r" % (env.get("deployment_branch_policy"),))
             else:
-                pols, _ = _branch_policies(api, repo, "release-publish", 7)
-                if pols != {("v*", "tag")}:
-                    problems.append("branch policies are %s" % sorted(pols, key=str))
+                try:
+                    pols, _ = _branch_policies(api, repo, "release-publish", 7)
+                except ValueError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — budget/network: not checked; re-raised below
+                    deferred = exc
+                else:
+                    if pols != {("v*", "tag")}:
+                        problems.append("branch policies are %s" % sorted(pols, key=str))
         except ValueError as exc:
             problems.append("unreadable answer: %s" % exc)
     if problems:
         run.alert(key, "release-publish on %s differs from the pinned rules: %s" % (repo, "; ".join(problems)))
+    elif deferred is None:
+        run.judged(key)
     want = set(chan.get("rulesets_expected") or [])
-    got = {r.get("name") for r in rulesets if isinstance(r, dict) and r.get("enforcement") == "active"} \
-        if isinstance(rulesets, list) else set()
-    if want - got:
+    rs_ok = isinstance(rulesets, list) and all(isinstance(r, dict) for r in rulesets)
+    got = {r.get("name") for r in rulesets if r.get("enforcement") == "active"} if rs_ok else set()
+    if rs_ok and want - got:
         run.alert(rs_key, "informational: active ruleset(s) missing on %s: %s" % (repo, ", ".join(sorted(want - got))))
+    elif rs_ok:
+        run.judged(rs_key)
+    if deferred is not None:
+        raise deferred
+    if not rs_ok:
+        raise ValueError("rulesets answer is not a list of objects")
     if not problems and not (want - got):
         run.ok("release-publish rules and rulesets as pinned")
 
@@ -528,6 +561,7 @@ def seed_baseline(api, cfg, channel, chan, run, aud, runs, now):
                       "seeded and is NOT recomputed" % (b.get("cutoff"), cutoff_s))
         else:
             run.judged(channel + "/baseline-config")
+        run.judged(channel + "/baseline-invalid")
         return True
     if cutoff is None:
         raise ValueError("signing_cutoff missing or malformed for %s" % channel)
@@ -538,7 +572,9 @@ def seed_baseline(api, cfg, channel, chan, run, aud, runs, now):
     pinned_runs = {int(p["run_id"]) for p in pinned}
     sign_name = chan.get("signing_job") or ""
     todo = [r for r in runs if (parse_ts(r.get("created_at")) or 0) < cutoff or _int(r.get("id")) in pinned_runs]
-    run.judged(channel + "/baseline-invalid")
+    # baseline-invalid is judged only when the seed COMPLETES (every pinned
+    # execution matched): a partial seed or a failed job-list read proves
+    # nothing about it.
     # Seeding reads one job list per pre-gate run. It is spread over several
     # hourly checks (at most `seed_runs_per_check` runs each) so the rest of
     # the hourly checks keep their share of the 60/hour budget meanwhile.
@@ -589,6 +625,7 @@ def seed_baseline(api, cfg, channel, chan, run, aud, runs, now):
         return False
     b["complete"] = True
     b["completed_at"] = now
+    run.judged(channel + "/baseline-invalid")
     b["executions"].sort()
     newest = max(b["executions"], key=lambda x: x[1]) if b["executions"] else None
     run.info("%s: legacy signing baseline recorded ONCE (cutoff %s): %d pre-gate execution(s)%s — fixed from now on"
@@ -721,30 +758,13 @@ def deployments_audit(api, cfg, channel, chan, run, st, now):
         reached = sum(int(rs.get("env_capacity") or 0) for rs in members.values())
         settled_cap = execs + reached
         capacity = settled_cap + pend
-        run.judged(akey, ukey)
+        run.judged(ukey)
         bad_runs = sorted(rid for rid, rs in members.items() if rs.get("verdict") == "unverified")
         if bad_runs:
             run.alert(ukey, "%s deployment group %s contains signing run(s) that are UNVERIFIED: %s"
                       % (env_name, gk, ", ".join(bad_runs)))
-        # target_url / log_url are only hints, re-read while the group is open
-        group_runs = set(members)
-        if not all(known[str(d["id"])].get("settled") for d in ds):
-            for d in ds:
-                hkey = channel + "/deploy-hint/" + str(d["id"])
-                statuses = api.get("/repos/%s/deployments/%d/statuses" % (repo, d["id"]), {"per_page": 100}, priority=5)
-                run.judged(hkey)
-                if not isinstance(statuses, list):
-                    raise ValueError("deployment statuses answer is not a list")
-                pat = re.compile(r"^https://github\.com/%s/actions/runs/(\d+)(?:/job/\d+)?/?$" % re.escape(repo))
-                for s in statuses:
-                    for u in (s.get("target_url"), s.get("log_url")) if isinstance(s, dict) else ():
-                        if u:
-                            m = pat.match(u)
-                            if not m or m.group(1) not in group_runs:
-                                run.alert(hkey, "deployment %d (%s) carries a status pointing at %s, which is not a "
-                                          "pinned-workflow run of the same tag/commit — UNVERIFIED (statuses are "
-                                          "writable by any push caller)" % (d["id"], gk, u))
-                                break
+        # the count verdict needs only the (complete) listing and the run records:
+        # it is established — and judged — before any hint request can fail
         count = len(ds)
         prev = aud["anomalies"].get(gk)
         if capacity == 0 or count > capacity:
@@ -758,6 +778,26 @@ def deployments_audit(api, cfg, channel, chan, run, st, now):
                 run.alert(akey, prev + " (kept: a pending signing instance never clears an earlier anomaly)")
             else:
                 aud["anomalies"].pop(gk, None)
+        run.judged(akey)
+        # target_url / log_url are only hints, re-read while the group is open
+        group_runs = set(members)
+        if not all(known[str(d["id"])].get("settled") for d in ds):
+            for d in ds:
+                hkey = channel + "/deploy-hint/" + str(d["id"])
+                statuses = api.get("/repos/%s/deployments/%d/statuses" % (repo, d["id"]), {"per_page": 100}, priority=5)
+                if not isinstance(statuses, list) or any(not isinstance(x, dict) for x in statuses):
+                    raise ValueError("deployment statuses answer is not a list of objects")   # hkey stays unjudged
+                pat = re.compile(r"^https://github\.com/%s/actions/runs/(\d+)(?:/job/\d+)?/?$" % re.escape(repo))
+                for s in statuses:
+                    for u in (s.get("target_url"), s.get("log_url")):
+                        if u:
+                            m = pat.match(u)
+                            if not m or m.group(1) not in group_runs:
+                                run.alert(hkey, "deployment %d (%s) carries a status pointing at %s, which is not a "
+                                          "pinned-workflow run of the same tag/commit — UNVERIFIED (statuses are "
+                                          "writable by any push caller)" % (d["id"], gk, u))
+                                break
+                run.judged(hkey)     # only after the whole, valid status list was scanned
         if not pend and not prev and gk not in aud["anomalies"] and all(
                 rs.get("verdict") in ("approved", "legacy", "settled-unexecuted", "unverified") for rs in members.values()):
             for d in ds:

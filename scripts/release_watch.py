@@ -578,6 +578,10 @@ def validate_state(data):
             raise ValueError("full_hash_at holds a non-numeric timestamp")
     if any(not isinstance(m, str) for m in data.get("queued", [])):
         raise ValueError("queued holds a non-string entry")
+    outbox = data.get("confirm_outbox", [])
+    if not isinstance(outbox, list) or any(not isinstance(o, dict) or not isinstance(o.get("text"), str)
+                                           or not isinstance(o.get("composed"), (int, float)) for o in outbox):
+        raise ValueError("confirm_outbox malformed")
     for key, a in data.get("active", {}).items():
         if not isinstance(a, dict) or not isinstance(a.get("first"), (int, float)) or not isinstance(a.get("last_sent"), (int, float)):
             raise ValueError("active[%s] malformed" % key)
@@ -844,6 +848,17 @@ class Run:
     def info(self, text):
         print("  ℹ %s" % text)
         self.infos.append(text)
+
+    def positive(self, channel, tag, text):
+        """A positive release message (✅ / ☑️ / 'recorded'). It goes to the
+        durable outbox, NOT to flush(): cmd_check saves the state — the
+        recorded release, observed approval, rollback floor and the cleared
+        pending confirmation — BEFORE delivering it, and keeps an undelivered
+        one for the next run. A crash between delivery and the second save
+        can repeat it (never: send it without its saved evidence)."""
+        print("  ✔ %s" % text)
+        self.state.data.setdefault("confirm_outbox", []).append(
+            {"channel": channel, "tag": tag, "text": text, "composed": now_ts()})
 
     def ok(self, text):
         print("  ✔ %s" % text)
@@ -1300,9 +1315,10 @@ def check_core(cfg, channel, run, now):
                     "envelope_sha256": live["envelope_sha256"], "provenance": live["provenance"],
                     "workflow_run": live.get("workflow_run"), "approval": appr, "first_seen": now}
             else:
-                run.info("%s: %s (sequence %d, commit %s) corroborated and RECORDED as the authorized release — %s%s"
-                         % (channel, tag, live["sequence"], tag_commit[:12], live["provenance"],
-                            (", approved by user id %d" % appr["user_id"]) if appr else ""))
+                run.positive(channel, live["tag"], "ℹ️ briglia release watch — %s: %s (sequence %d, commit %s) corroborated "
+                             "and RECORDED as the authorized release — %s%s"
+                             % (channel, tag, live["sequence"], tag_commit[:12], live["provenance"],
+                                (", approved by user id %d" % appr["user_id"]) if appr else ""))
             rec = live
         run.judged(channel + "/uncorroborated-release", channel + "/local-provenance", channel + "/record-mismatch")
     elif rec["sequence"] > live["sequence"]:
@@ -1649,10 +1665,13 @@ def write_site_cache(cfg, st, now):
 
 def confirm_releases(cfg, run, now, site_gen):
     """§7: a ✅ only when every relevant check of that channel passed in
-    THIS run, the checker's own website fetch matches, and the site job's
-    current state is clean and fresh. Otherwise nothing (incomplete states
-    are folded into the daily status) until the release has been pending
-    longer than the hourly freshness limit — then one ⚠️."""
+    THIS run — the fixed core set plus EVERY check that was due this run
+    (deployments, events, env-publish, deletion, …), with nothing skipped —
+    the checker's own website fetch matches, and the site job's current
+    state is clean and fresh. Otherwise nothing (incomplete states are folded
+    into the daily status) until the release has been pending longer than
+    the hourly freshness limit — then one ⚠️. A ✅ goes to the durable
+    outbox (Run.positive) and is sent only after the state is saved."""
     import sentinel_site   # noqa: PLC0415 — site probe helpers (no state, no lock)
     st = run.state.data
     pend = st.get("pending_confirm") or {}
@@ -1671,9 +1690,14 @@ def confirm_releases(cfg, run, now, site_gen):
             needed |= {"env-rules", "signing-audit"}
         if chan.get("installer_asset"):
             needed.add("installer")
-        missing = sorted(needed - run.done.get(channel, set()))
+        # Every check that was DUE this run counts, not only a fixed list:
+        # due-and-skipped work (budget, network, crash) is never "complete".
+        # Work that was not due (fresh) need not run again.
+        missing = sorted((needed | run.due.get(channel, set())) - run.done.get(channel, set()))
         if missing:
             reasons.append("not checked in this run: " + ", ".join(missing))
+        if run.partial.get(channel):
+            reasons.append("partial run: " + "; ".join(run.partial[channel]))
         open_keys = sorted(k for k in set(st["active"]) | set(run.findings)
                            if k.startswith(channel + "/") and not run.is_report_only(k))
         if open_keys:
@@ -1698,7 +1722,7 @@ def confirm_releases(cfg, run, now, site_gen):
                 msg = "☑️ Local provenance, NOT phone-approved CI: " + msg[2:]
             if n_ro and audit_report_only(cfg):
                 msg += " (signing audit in report-only mode: %d open item(s), see the daily status)" % n_ro
-            run.extra_messages.append(msg)
+            run.positive(channel, rec["tag"], msg)
             pend.pop(channel)
             continue
         if now - pc["first_seen"] > hourly_limit and not pc.get("warned"):
@@ -1708,6 +1732,35 @@ def confirm_releases(cfg, run, now, site_gen):
 
 
 # ------------------------------------------------------------- check run
+
+def deliver_outbox(cfg, state):
+    """Send the durable positive messages (already saved), oldest first, and
+    drop each one only after Telegram confirmed it. The trimmed outbox is
+    saved again; if that second save fails, the delivered ones stay in the
+    saved outbox and may be repeated by the next run — a duplicate, never a
+    message without saved evidence and never a lost one."""
+    st = state.data
+    outbox = list(st.get("confirm_outbox") or [])
+    if not outbox:
+        return []
+    sent, keep = [], []
+    for item in outbox:
+        if send_telegram(cfg, item["text"]):
+            sent.append(item["text"])
+        else:
+            keep.append(item)
+    del keep[:-MAX_QUEUED]
+    st["confirm_outbox"] = keep
+    if sent:
+        try:
+            state.save()
+        except Exception as exc:  # noqa: BLE001 — delivered already; a repeat next run is the accepted cost
+            print("  ! state save after delivering %d positive message(s) failed (%s) — they may be repeated next run"
+                  % (len(sent), exc), file=sys.stderr)
+    if keep:
+        print("  ⋯ %d positive message(s) kept in the outbox for the next run (Telegram did not confirm)" % len(keep))
+    return sent
+
 
 def cmd_check(cfg):
     global API
@@ -1829,13 +1882,16 @@ def cmd_check(cfg):
         if not alerting and not partial and not preserved:
             st["last_clean"] = now
         prune_state(st)
-        state.save()
+        state.save()      # the evidence of every positive message is durable BEFORE it is sent
+        messages += deliver_outbox(cfg, state)
+        outbox = st.get("confirm_outbox") or []
+        oldest = [x for x in [st.get("queued_since")] + [o["composed"] for o in outbox] if x is not None]
         state.write_beacon({
             "version": WATCH_VERSION, "completed": now, "completed_total": st["completed_total"],
             "findings": len([k for k in run.findings if not run.is_report_only(k)]) + len(preserved),
             "open": alerting, "report_only_open": report_open, "held": held,
             "coverage_warnings": sorted(k for k in alerting if "/coverage/" in k),
-            "partial": partial, "queued": len(st["queued"]), "oldest_queued": st.get("queued_since"),
+            "partial": partial, "queued": len(st["queued"]) + len(outbox), "oldest_queued": min(oldest) if oldest else None,
             "recorded": {c: {"tag": r["tag"], "sequence": r["sequence"]} for c, r in st["recorded"].items()},
             "rate_history": hist[-60:], "requests": BUDGET.requests, "rate_min": BUDGET.min_seen,
             "audit_mode": "report-only" if audit_report_only(cfg) else "alert",
@@ -1843,12 +1899,15 @@ def cmd_check(cfg):
             "baseline": {c: {"complete": bool((a.get("baseline") or {}).get("complete")),
                              "executions": len((a.get("baseline") or {}).get("executions") or [])}
                          for c, a in (st.get("audit") or {}).items()},
-            "site_generation": site_gen, "pending_confirm": sorted((st.get("pending_confirm") or {}))})
+            "site_generation": site_gen,
+            "pending_confirm": sorted(set(st.get("pending_confirm") or {}) | {o.get("channel") for o in outbox
+                                                                                  if o.get("channel")})})
     finally:
         state.__exit__(None, None, None)
     print("check complete: %d finding(s), %d unresolved kept, %d partial channel(s), %d message(s), %d queued; "
           "%d GitHub request(s), lowest remaining %s"
-          % (len(run.findings), len(preserved), len(partial), len(messages), len(state.data["queued"]),
+          % (len(run.findings), len(preserved), len(partial), len(messages),
+             len(state.data["queued"]) + len(state.data.get("confirm_outbox") or []),
              BUDGET.requests, BUDGET.min_seen))
     alerting_now = [k for k in run.findings if not run.is_report_only(k)]
     return 2 if (alerting_now or preserved) else 0
@@ -1871,8 +1930,12 @@ def cmd_acknowledge_local(cfg, channel, tag, envelope_sha256):
 
 
 def cmd_acknowledge_finding(cfg, key):
-    """Owner act: close one event-feed finding (deleted tag, unconfirmed
-    published release, feed gap) — findings no later check can clear."""
+    """Owner act, after inspecting it: close exactly one event-feed finding
+    that describes a historical incident no later check can clear (a deleted
+    tag, a non-v<semver> tag, a feed gap; an unconfirmed release that was
+    deleted). It never touches release approval evidence or the recorded
+    rollback floor. `event-release-unconfirmed/<tag>` normally needs no
+    acknowledgment: it clears by itself once that release is recorded."""
     with State(cfg["state_dir"]) as state:
         st = state.data
         channel = key.split("/", 1)[0]

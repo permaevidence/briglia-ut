@@ -1071,9 +1071,13 @@ def main():
         fake.faults["tg_status"] = 500
         run()
         del fake.faults["tg_status"]
-        queued = state()["queued"]
-        check("✅ composed while Telegram is down is QUEUED (kept, not lost)", any("✅ Verified briglia-cli v0.2.54" in m for m in queued), queued)
-        vt = re.search(r"Verified at ([0-9: -]+) \(Mac 2\)", next(m for m in queued if "✅ Verified briglia-cli v0.2.54" in m)).group(1)
+        queued = [o["text"] for o in state().get("confirm_outbox", [])]
+        check("✅ composed while Telegram is down is KEPT in the saved outbox (not lost)",
+              any("✅ Verified briglia-cli v0.2.54" in m for m in queued) and "briglia-cli" not in state().get("pending_confirm", {}),
+              queued)
+        m0 = next((m for m in queued if "✅ Verified briglia-cli v0.2.54" in m), "")
+        vt = (re.search(r"Verified at ([0-9: -]+) \(Mac 2\)", m0) or re.search("(?!)", "")) if m0 else None
+        vt = vt.group(1) if vt else "<none kept>"
         fake.telegram.clear()
         run()
         late = tg("✅ Verified briglia-cli v0.2.54")
@@ -1489,11 +1493,406 @@ exit 0
         src_i = open(os.path.join(scripts, "sentinel", "install_sentinel.py")).read()
         check("test options are refused when running as root (static guard present)",
               'if self.test and os.geteuid() == 0:' in src_i and "test options are refused when running as root" in src_i)
+        recovery_and_confirmation_regressions(scripts)
     finally:
         fake.close()
         shutil.rmtree(root, ignore_errors=True)
     print("\nsentinel selftest: %d passed, %d failed" % (PASSED, FAILED))
     return 1 if FAILED else 0
+
+
+def recovery_and_confirmation_regressions(scripts):
+    """In-process regressions: a finding clears ("recovered") only after the
+    owning check established — completely and validly — every predicate the
+    finding is about; a ✅ needs every DUE check of this run; and a positive
+    message is sent only after its verification record is durably saved.
+    Each scenario ends with a real passing check that recovers / confirms
+    exactly once. Every scenario uses throwaway state dirs, a fake transport
+    and a stubbed Telegram — never the live watcher, never the network."""
+    import types
+    import urllib.error
+    sys.path.insert(0, scripts)
+    import release_watch as W  # noqa: E402
+    import watch_audit as A  # noqa: E402
+    import sentinel_site as S  # noqa: E402
+    print("— recovery / confirmation regressions (in-process) —")
+    now = 1791303410
+    work = tempfile.mkdtemp(prefix="briglia-sentinel-regress-")
+    base = copy.deepcopy(W.DEFAULT_CONFIG)
+    base.update(signing_audit_alerts=True, realert_hours=0, realert_on_change=False,
+                state_dir=os.path.join(work, "never-used"), telegram_env_file=os.path.join(work, "no.env"),
+                telegram_api="http://127.0.0.1:9/tg", github_api="http://127.0.0.1:9/api")
+    sent = []
+    saved = {"W.send_telegram": W.send_telegram, "W.State": W.State, "W.now_ts": W.now_ts,
+             "W.check_core": W.check_core, "W.check_release_list": W.check_release_list, "W.check_rest": W.check_rest,
+             "S.first_hop": S.first_hop, "S.fetch": S.fetch, "S.confirmation_evidence": S.confirmation_evidence}
+    W.send_telegram = lambda cfg, text: sent.append(text) or True
+
+    def scenario(label, fn):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 — an old implementation may crash: that is a failure, not an abort
+            check(label + " (scenario raised)", False, "%s: %s" % (type(exc).__name__, exc))
+
+    def run_with_alert(*keys, cfg=None):
+        st = types.SimpleNamespace(dir=work, data={"active": {k: {"first": now - 3600, "last_sent": now - 3600,
+                                                                   "text": "confirmed problem", "notified": True}
+                                                               for k in keys}, "queued": []})
+        return W.Run(cfg or base, st)
+
+    # ------------------------------------------------ website job
+    RED = "https://github.com/installer"
+    body = b"#!/bin/sh\necho verified\n"
+    cache = {"generation": 1, "content": {"channels": {"briglia-cli": {
+        "kind": "cli", "sequence": 109, "website_install_url": ["https://a/install.sh", "https://b/install.sh"],
+        "redirect": RED, "installer": {"sha256": sha(body), "size": len(body)}}}}}
+
+    def site_world(hop, get=None):
+        S.first_hop = lambda url, timeout=30: hop(url)
+        S.fetch = get or (lambda url, timeout=60: (200, body))
+
+    def down(url):
+        raise urllib.error.URLError("connection failed")
+
+    def good(url):
+        return 302, RED
+
+    def site_pass(st, key):
+        site_world(good)
+        f, j = S.check_site({"check_minute": 23}, cache, st, now + 300)
+        m = S.apply({}, st, f, j, now + 300)
+        return [x for x in m if "recovered: " + key in x]
+
+    def site_redirect_network():
+        st = {"active": {"briglia-cli/site-redirect": {"first": now - 3600, "text": "bad redirect", "notified": True}}}
+        site_world(lambda url: down(url) if "//a/" in url else good(url))
+        f, j = S.check_site({"check_minute": 23}, cache, st, now)
+        m = S.apply({}, st, f, j, now)
+        check("website: a bad-redirect alert is NOT 'recovered' while one host's first hop is unreachable (the other "
+              "host passing proves nothing about it)", not any("recovered: briglia-cli/site-redirect" in x for x in m)
+              and "briglia-cli/site-redirect" in st["active"], m)
+        rec = site_pass(st, "briglia-cli/site-redirect")
+        check("…a real pass on every host → exactly ONE recovery", len(rec) == 1 and not site_pass(st, "briglia-cli/site-redirect"), rec)
+    scenario("website: bad redirect + network", site_redirect_network)
+
+    def site_content_redirect():
+        st = {"active": {"briglia-cli/site-content": {"first": now - 3600, "text": "bad bytes", "notified": True}}}
+        site_world(lambda url: (302, "https://evil.example/x"))
+        f, j = S.check_site({"check_minute": 23}, cache, st, now)
+        m = S.apply({}, st, f, j, now)
+        check("website: a wrong redirect raises site-redirect but does NOT 'recover' an open bad-content alert "
+              "(the installer bytes were never fetched)", any("briglia-cli/site-redirect" in x for x in m)
+              and not any("recovered: briglia-cli/site-content" in x for x in m) and "briglia-cli/site-content" in st["active"], m)
+        rec = site_pass(st, "briglia-cli/site-content")
+        check("…a real pass → exactly ONE recovery of site-content", len(rec) == 1, rec)
+    scenario("website: bad content + redirect", site_content_redirect)
+
+    def site_transition_kept():
+        for label, hop, get in (
+                ("a wrong redirect (content not checked)", lambda url: (302, "https://evil.example/x"), None),
+                ("the bytes behind a correct redirect unreachable", good,
+                 lambda url, timeout=60: (_ for _ in ()).throw(urllib.error.URLError("reset"))),
+                ("one host unreachable", lambda url: down(url) if "//a/" in url else good(url), None)):
+            dl = now + 1500
+            st = {"active": {}, "transitions": {"briglia-cli": {"first": now - 600, "deadline": dl, "candidate_sequence": 120,
+                                                                "generation": 1, "kind": "unverified"}}}
+            site_world(hop, get)
+            f, j = S.check_site({"check_minute": 23}, cache, st, now)
+            S.apply({}, st, f, j, now)
+            t = st.get("transitions", {}).get("briglia-cli")
+            check("website: an open transition survives %s, with its ORIGINAL fixed deadline" % label,
+                  t is not None and t["deadline"] == dl and t["first"] == now - 600, st.get("transitions"))
+        site_world(good)
+        S.check_site({"check_minute": 23}, cache, st, now)
+        check("…and closes only when the content is verified on EVERY host", "briglia-cli" not in st.get("transitions", {}),
+              st.get("transitions"))
+    scenario("website: transition deadline", site_transition_kept)
+
+    # ------------------------------------------------ environment rules
+    chan = {"repo": CLI, "environment_ids": {"release-sign": CLI_ENV, "release-publish": CLI_PUB}, "approver_user_id": REV,
+            "rulesets_expected": []}
+    good_bp = {"total_count": 1, "branch_policies": [{"name": "v*", "type": "tag"}]}
+
+    class EnvAPI:
+        def __init__(self, env, bp_fail=True):
+            self.env, self.bp_fail = env, bp_fail
+
+        def get(self, path, *args, **kw):
+            if path.endswith("/deployment-branch-policies"):
+                if self.bp_fail:
+                    raise W.WatchError("connection failed", transient=True)
+                return good_bp
+            if path.endswith("/rulesets"):
+                return []
+            return self.env
+
+    def env_rules():
+        r = run_with_alert("briglia-cli/env-rules")
+        W._guard(r, "briglia-cli", "env-rules", lambda: A.check_env_rules(EnvAPI(env_obj(CLI_ENV)), base, "briglia-cli",
+                                                                          chan, r), set())
+        m = r.flush(now)
+        check("env-rules: the branch-policy request failing (network) does NOT 'recover' an open env-rules alert",
+              not any("recovered: briglia-cli/env-rules" in x for x in m) and "briglia-cli/env-rules" in r.state.data["active"]
+              and r.partial.get("briglia-cli"), (m, r.partial))
+        r = run_with_alert(cfg=base)
+        W._guard(r, "briglia-cli", "env-rules", lambda: A.check_env_rules(EnvAPI(env_obj(CLI_ENV, bypass=True)), base,
+                                                                          "briglia-cli", chan, r), set())
+        m = r.flush(now)
+        check("env-rules: a weakening already established (admin bypass) still ALERTS when the later branch-policy "
+              "request fails", any("briglia-cli/env-rules" in x and "can_admins_bypass" in x for x in m), m)
+        r = run_with_alert("briglia-cli/env-rules")
+        W._guard(r, "briglia-cli", "env-rules", lambda: A.check_env_rules(EnvAPI(env_obj(CLI_ENV), bp_fail=False), base,
+                                                                          "briglia-cli", chan, r), set())
+        m = r.flush(now)
+        check("…a complete, valid pass → exactly ONE recovery", len([x for x in m if "recovered: briglia-cli/env-rules" in x]) == 1, m)
+    scenario("env-rules", env_rules)
+
+    def env_publish():
+        pub = env_obj(CLI_PUB, "release-publish", reviewer_rule=False)
+        r = run_with_alert("briglia-cli/env-publish")
+        W._guard(r, "briglia-cli", "env-publish", lambda: A.check_env_publish(EnvAPI(pub), base, "briglia-cli", chan, r) or True,
+                 set())
+        m = r.flush(now)
+        check("env-publish (release-publish path): a failed branch-policy request does NOT 'recover' its alert",
+              not any("recovered: briglia-cli/env-publish" in x for x in m) and "briglia-cli/env-publish" in r.state.data["active"], m)
+        r = run_with_alert("briglia-cli/env-publish")
+        W._guard(r, "briglia-cli", "env-publish", lambda: A.check_env_publish(EnvAPI(pub, bp_fail=False), base, "briglia-cli",
+                                                                              chan, r) or True, set())
+        m = r.flush(now)
+        check("…a complete pass → exactly ONE recovery", len([x for x in m if "recovered: briglia-cli/env-publish" in x]) == 1, m)
+    scenario("env-publish", env_publish)
+
+    # ------------------------------------------------ deployments
+    class DepAPI:
+        def __init__(self, statuses):
+            self.statuses = statuses
+
+        def paged(self, *args, **kw):
+            return [{"id": 100, "sha": "a" * 40, "ref": "v0.9.0"}]
+
+        def get(self, *args, **kw):
+            return self.statuses
+
+    def dep_run(statuses):
+        r = run_with_alert("briglia-cli/deploy-hint/100")
+        aud = A.channel_audit(r.state.data, "briglia-cli")
+        aud["baseline"] = {"complete": True, "executions": []}
+        aud["runs"] = {"123": {"head_sha": "a" * 40, "head_branch": "v0.9.0", "verdict": "approved",
+                               "executions": [{"identity": ["123", "start", "end", "runner"]}], "env_capacity": 0}}
+        dchan = dict(chan, deployment_boundary={"id": 100, "inclusive": True})
+        W._guard(r, "briglia-cli", "deployments", lambda: A.deployments_audit(DepAPI(statuses), base, "briglia-cli", dchan, r,
+                                                                              r.state.data, now), set())
+        return r, r.flush(now)
+
+    def deployments():
+        r, m = dep_run({"message": "unexpected object instead of statuses list"})
+        check("deployments: a malformed statuses answer raises deployments-unreadable and does NOT 'recover' the open "
+              "deploy-hint alert", any("deployments-unreadable" in x for x in m)
+              and not any("recovered: briglia-cli/deploy-hint/100" in x for x in m), m)
+        r, m = dep_run([{"state": "success", "target_url": "https://github.com/%s/actions/runs/123/job/1" % CLI}])
+        check("…a valid status list pointing at the group's own run → exactly ONE recovery",
+              len([x for x in m if "recovered: briglia-cli/deploy-hint/100" in x]) == 1, m)
+    scenario("deployments", deployments)
+
+    def baseline_partial():
+        bchan = dict(chan, signing_cutoff="2026-10-04T23:56:06Z", legacy_pinned_executions=[])
+
+        class SeedAPI:
+            def paged(self, *args, **kw):
+                return []
+        runs_ = [{"id": 5, "created_at": "2026-01-01T00:00:00Z"}]
+        r = run_with_alert("briglia-cli/baseline-invalid")
+        aud = A.channel_audit(r.state.data, "briglia-cli")
+        A.seed_baseline(SeedAPI(), dict(base, seed_runs_per_check=0), "briglia-cli", bchan, r, aud, runs_, now)
+        m = r.flush(now)
+        check("baseline: a seed left partial (budget share used up) does NOT 'recover' an open baseline-invalid alert",
+              not any("recovered: briglia-cli/baseline-invalid" in x for x in m), m)
+        r.state.data["active"]["briglia-cli/baseline-invalid"] = {"first": now - 3600, "last_sent": now - 3600,
+                                                                   "text": "x", "notified": True}
+        r2 = W.Run(base, r.state)
+        A.seed_baseline(SeedAPI(), dict(base, seed_runs_per_check=15), "briglia-cli", bchan, r2, aud, runs_, now)
+        m = r2.flush(now)
+        check("…the seed completing → exactly ONE recovery", len([x for x in m if "recovered: briglia-cli/baseline-invalid" in x]) == 1, m)
+    scenario("baseline", baseline_partial)
+
+    # ------------------------------------------------ ✅ needs every due check
+    rec = {"tag": "v0.9.0", "version": "0.9.0", "sequence": 9, "commit": "a" * 40, "envelope_sha256": "b" * 64,
+           "assets": {"click": {"url": "https://x/click", "size": 1, "sha256": "c" * 64}}}
+    pc = dict(tag="v0.9.0", sequence=9, commit="a" * 40, envelope_sha256="b" * 64, first_seen=now - 10,
+              provenance="ci, phone-approved", workflow_run=123, approval={"user_id": REV})
+    ccfg = dict(base, channels={"briglia-ut": {"kind": "app"}}, audits=True, confirmations=True)
+    S.confirmation_evidence = lambda *args: (True, "")
+
+    def confirm_with(due_extra, skipped):
+        state = types.SimpleNamespace(dir=work, data={"recorded": {"briglia-ut": dict(rec)}, "active": {}, "queued": [],
+                                                      "pending_confirm": {"briglia-ut": dict(pc)},
+                                                      "full_hash_at": {"briglia-ut": now}})
+        r = W.Run(ccfg, state)
+        r.make_due("briglia-ut", "core", "release-list", "assets", "expiry", "env-rules", "signing-audit", *due_extra)
+        r.performed("briglia-ut", "core", "release-list", "assets", "expiry", "env-rules", "signing-audit",
+                    *[c for c in due_extra if c not in skipped])
+        if skipped:
+            r.skipped("briglia-ut", "budget exhausted", *skipped)
+        W.confirm_releases(ccfg, r, now, 1)
+        out = [o["text"] for o in state.data.get("confirm_outbox", [])] + r.extra_messages
+        return state, out
+
+    def partial_confirm():
+        for skipped in (("deployments", "events"), ("env-publish",), ("deletion",)):
+            state, out = confirm_with(("deployments", "events", "deletion", "env-publish"), skipped)
+            check("✅: due-but-skipped %s (budget) → NO ✅, the pending confirmation survives" % "+".join(skipped),
+                  not any(x.startswith("✅") for x in out) and "briglia-ut" in state.data["pending_confirm"], out)
+        state, out = confirm_with(("deployments", "events", "deletion", "env-publish"), ())
+        check("…every due check performed → exactly ONE ✅ (into the saved outbox), pending cleared",
+              len([x for x in out if x.startswith("✅ Verified briglia-ut v0.9.0")]) == 1
+              and "briglia-ut" not in state.data["pending_confirm"], out)
+        state, out = confirm_with((), ())
+        check("…a lower-frequency check NOT due (fresh) does not block the ✅",
+              len([x for x in out if x.startswith("✅ Verified")]) == 1, out)
+    scenario("✅ partial", partial_confirm)
+
+    # ------------------------------------------------ persist, then send
+    class FailSave(saved["W.State"]):
+        def save(self):
+            raise OSError("injected disk write failure")
+
+    def checked_core(cfg, ch, run_, ts):
+        st_ = run_.state.data
+        if ch not in st_["recorded"]:
+            st_["recorded"][ch] = dict(rec)
+            st_.setdefault("pending_confirm", {})[ch] = dict(pc)
+            st_.setdefault("audit", {}).setdefault(ch, {}).setdefault("runs", {})["123"] = {"approvals": {"1": [{"user_id": REV}]}}
+        st_["full_hash_at"][ch] = now
+        run_.performed(ch, "core")
+        return {"fixture": True}
+
+    def disk_world():
+        W.now_ts = lambda: now
+        W.check_core = checked_core
+        W.check_release_list = lambda cfg, ch, run_, ctx: run_.performed(ch, "release-list")
+        W.check_rest = lambda cfg, ch, run_, ts, ctx: run_.performed(ch, "assets", "expiry")
+        d = tempfile.mkdtemp(dir=work)
+        return dict(ccfg, audits=False, mode="local", state_dir=d), d
+
+    def load(d):
+        return json.load(open(os.path.join(d, "state.json")))
+
+    def save_failure():
+        dcfg, d = disk_world()
+        W.State = FailSave
+        sent.clear()
+        raised = False
+        try:
+            W.cmd_check(dcfg)
+        except OSError:
+            raised = True
+        finally:
+            W.State = saved["W.State"]
+        check("persist-then-send: a FAILED state save → the run fails and NO ✅ was sent (nothing durable backs it)",
+              raised and not any("✅" in x for x in sent), sent)
+        sent.clear()
+        W.cmd_check(dcfg)
+        st_ = load(d)
+        check("…next run with a working disk: exactly ONE ✅, and the saved state holds the recorded release, the "
+              "observed approval and no pending/outbox entry", len([x for x in sent if x.startswith("✅ Verified")]) == 1
+              and st_["recorded"]["briglia-ut"]["sequence"] == 9 and st_["audit"]["briglia-ut"]["runs"]["123"]["approvals"]
+              and not st_.get("pending_confirm") and not st_.get("confirm_outbox"), (sent, st_.get("confirm_outbox")))
+        sent.clear()
+        W.cmd_check(dcfg)
+        check("…and it is never repeated", not any("✅" in x for x in sent), sent)
+    scenario("persist: save failure", save_failure)
+
+    def send_order():
+        # the ✅ must be sent only once the state carrying its evidence is on disk
+        dcfg, d = disk_world()
+        seen = []
+
+        def spy(cfg, text):
+            if text.startswith("✅"):
+                try:
+                    st_ = load(d)
+                except Exception:  # noqa: BLE001
+                    st_ = {}
+                seen.append(bool(st_.get("recorded", {}).get("briglia-ut")) and not st_.get("pending_confirm"))
+            sent.append(text)
+            return True
+        W.send_telegram = spy
+        try:
+            W.cmd_check(dcfg)
+        finally:
+            W.send_telegram = lambda cfg, text: sent.append(text) or True
+        check("persist-then-send: when the ✅ goes out, the saved state.json ALREADY records the release and has no "
+              "pending confirmation", seen == [True], seen)
+    scenario("persist: order", send_order)
+
+    def delivery_failure():
+        dcfg, d = disk_world()
+        W.send_telegram = lambda cfg, text: False
+        try:
+            W.cmd_check(dcfg)
+        finally:
+            W.send_telegram = lambda cfg, text: sent.append(text) or True
+        st_ = load(d)
+        box = [o["text"] for o in st_.get("confirm_outbox", [])]
+        check("delivery fails AFTER a successful save → the ✅ is kept in the SAVED outbox (not lost), pending cleared",
+              len(box) == 1 and box[0].startswith("✅ Verified") and not st_.get("pending_confirm"), (box, st_.get("pending_confirm")))
+        sent.clear()
+        W.now_ts = lambda: now + 3600
+        W.cmd_check(dcfg)
+        late = [x for x in sent if x.startswith("✅ Verified")]
+        check("…delivered on the next run exactly once, with its ORIGINAL verification time, outbox emptied",
+              len(late) == 1 and late[0] == box[0] and not load(d).get("confirm_outbox"), late)
+    scenario("persist: delivery failure", delivery_failure)
+
+    def crash_after_save():
+        dcfg, d = disk_world()
+
+        def crash(cfg, text):
+            raise KeyboardInterrupt("process killed between save and send")
+        W.send_telegram = crash
+        try:
+            W.cmd_check(dcfg)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            W.send_telegram = lambda cfg, text: sent.append(text) or True
+        st_ = load(d)
+        check("crash after the save, before delivery → the ✅ survives the restart in the saved outbox",
+              len(st_.get("confirm_outbox", [])) == 1 and not st_.get("pending_confirm"), st_.get("confirm_outbox"))
+        sent.clear()
+        W.cmd_check(dcfg)
+        check("…delivered once by the next run", len([x for x in sent if x.startswith("✅ Verified")]) == 1, sent)
+    scenario("persist: crash", crash_after_save)
+
+    def second_save_fails():
+        dcfg, d = disk_world()
+        calls = []
+
+        class FailSecond(saved["W.State"]):
+            def save(self):
+                calls.append(1)
+                if len(calls) == 2:
+                    raise OSError("second save fails")
+                return super().save()
+        W.State = FailSecond
+        sent.clear()
+        try:
+            W.cmd_check(dcfg)
+        finally:
+            W.State = saved["W.State"]
+        first = [x for x in sent if x.startswith("✅ Verified")]
+        sent.clear()
+        W.cmd_check(dcfg)
+        again = [x for x in sent if x.startswith("✅ Verified")]
+        check("the save AFTER delivery fails → the ✅ may repeat once next run (accepted: duplicate, never lost, never "
+              "unbacked), then the outbox is empty", len(first) == 1 and again == first and not load(d).get("confirm_outbox"),
+              (first, again))
+    scenario("persist: second save", second_save_fails)
+
+    for k, v in saved.items():
+        mod, attr = k.split(".")
+        setattr(W if mod == "W" else S, attr, v)
+    shutil.rmtree(work, ignore_errors=True)
 
 
 def iso_(ts):
