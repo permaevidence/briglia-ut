@@ -29,6 +29,31 @@ from signing_fixture import TestKey, raw_envelope  # noqa: E402
 PASSED = FAILED = 0
 
 
+
+def stdlib_names():
+    """sys.stdlib_module_names (3.10+); on 3.9 (macOS /usr/bin/python3, what
+    Mac 2 runs) the same answer from where each module actually lives."""
+    if hasattr(sys, "stdlib_module_names"):
+        return set(sys.stdlib_module_names)
+    import importlib.util
+    import sysconfig
+    roots = {os.path.realpath(sysconfig.get_paths()[k]) for k in ("stdlib", "platstdlib")}
+
+    class _Names(set):
+        def __ge__(self, other):
+            return all(n in self for n in other)
+
+        def __contains__(self, name):
+            if name in sys.builtin_module_names:
+                return True
+            try:
+                spec = importlib.util.find_spec(name)
+            except (ImportError, ValueError):
+                return False
+            origin = os.path.realpath(spec.origin) if spec and spec.origin and spec.origin not in ("built-in", "frozen") else ""
+            return bool(spec) and (spec.origin in ("built-in", "frozen") or any(origin.startswith(r + os.sep) for r in roots))
+    return _Names()
+
 def check(label, ok, detail=""):
     global PASSED, FAILED
     print("  %s %s%s" % ("✔" if ok else "✖", label, "" if ok or not detail else " — " + str(detail)[-500:]))
@@ -962,7 +987,7 @@ def main():
             m = re.match(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", line)
             if m:
                 imports.add(m.group(1).split(".")[0])
-        check("heartbeat imports the standard library only", imports and imports <= set(sys.stdlib_module_names), sorted(imports))
+        check("heartbeat imports the standard library only", imports and imports <= stdlib_names(), sorted(imports))
         check("heartbeat never imports the checker or the verifier module, nor extends sys.path",
               not imports & {"release_watch", "release_verify"} and "sys.path" not in src and "__import__" not in src)
         b = beacon()
