@@ -72,7 +72,7 @@ def main():
     cfg_path = os.path.join(root, "cfg.json")
     json.dump({
         "state_dir": state_dir, "github_api": B + "/api", "raw_base": B + "/raw",
-        "telegram_env_file": tg_env, "telegram_api": B + "/tg", "transient_grace_checks": 1, "audits": False,
+        "telegram_env_file": tg_env, "telegram_api": B + "/tg", "transient_grace_checks": 1, "audits": False, "retry_delay_seconds": 0.2,
         "channels": {
             "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "workflow_id": 77, "environment_ids": {"release-sign": ENV_ID}, "signing_cutoff": "2020-01-01T00:00:00Z",
                             "legacy_pinned_executions": [],  "installer_asset": None,

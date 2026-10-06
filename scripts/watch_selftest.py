@@ -181,6 +181,8 @@ class Fake:
                         fake.rate["remaining"] -= 1
                     if fake.faults.get("api_status"):
                         return self._json(fake.faults["api_status"], {"message": "injected"})
+                    if p in fake.faults.get("json_override", {}):   # HTTP 200, arbitrary (malformed) JSON
+                        return self._json(200, fake.faults["json_override"][p])
                     m = re.match(r"^/api/repos/([^/]+/[^/]+)/releases/latest$", p)
                     if m:
                         rels = [r for r in fake.releases.get(m.group(1), []) if not r["draft"]]
@@ -368,7 +370,7 @@ def main():
         "state_dir": state_dir, "github_api": B + "/api", "raw_base": B + "/raw",
         "telegram_env_file": tg_env, "telegram_api": B + "/tg",
         "realert_hours": 6, "heartbeat_max_age_hours": 3, "expiry_warning_days": 30,
-        "audits": False,
+        "audits": False, "retry_delay_seconds": 0.2,
         "channels": {
             "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "workflow_id": 77, "approval_required_above_sequence": 60,
                         "approver_user_id": 4242001,
@@ -705,7 +707,69 @@ def main():
         check("an OLDER (non-latest) published release that is not immutable → release-not-immutable alert naming it",
               rc == 2 and any("release-not-immutable" in m and "v0.1.58" in m for m in fake.telegram)
               and not any("/not-immutable" in m for m in fake.telegram), fake.telegram)
-        fake.releases["test/briglia-cli"][0]["immutable"] = True; run(); fake.telegram.clear()
+
+        # Codex 2026-10-06 reproductions: with that REAL finding active, a
+        # malformed or incomplete release list must neither crash into a
+        # "recovered" nor clear it; only a complete, valid list may.
+        print("— release-list findings survive malformed / incomplete lists —")
+        LIST_P, LATEST_P = "/api/repos/test/briglia-cli/releases", "/api/repos/test/briglia-cli/releases/latest"
+        NI = "briglia-cli/release-not-immutable"
+
+        def ni_recoveries():
+            return sum("recovered" in m and NI in m for m in fake.telegram)
+
+        fake.telegram.clear()
+        fake.faults["json_override"] = {LIST_P: {"message": "not a list"}}
+        rc, out = run()
+        check("REPRO: release list answers a JSON object (HTTP 200) → finding kept, NO recovery, run partial",
+              NI in state()["active"] and ni_recoveries() == 0 and rc == 2
+              and "unexpected response shape" in out and "not checked (briglia-cli)" in out
+              and "watcher raised" not in out, out)
+        fake.faults["json_override"] = {LIST_P: [{"tag_name": "v0.1.59", "draft": False, "immutable": True}, 7]}
+        rc, out = run()
+        check("release list with a non-object element partway through → finding kept, NO recovery, no crash",
+              NI in state()["active"] and ni_recoveries() == 0 and rc == 2
+              and "unexpected response shape" in out and "watcher raised" not in out, out)
+        fake.faults["json_override"] = {LIST_P: [{"tag_name": 5, "draft": False, "immutable": True}]
+                                        + list(reversed(fake.releases["test/briglia-cli"]))}
+        rc, out = run()
+        check("a non-string tag in the list → release-bad-tag alert, no crash, NO recovery of the older finding",
+              NI in state()["active"] and ni_recoveries() == 0 and "watcher raised" not in out
+              and any("release-bad-tag" in m for m in fake.telegram), out)
+        fake.faults["json_override"] = {LATEST_P: ["not", "an", "object"]}
+        rc, out = run()
+        check("releases/latest answers a JSON array → github-unreachable, finding kept, NO recovery, no crash",
+              NI in state()["active"] and ni_recoveries() == 0 and rc == 2
+              and "unexpected response shape" in out and "watcher raised" not in out, out)
+        healthy_others = [dict(r) for r in reversed(fake.releases["test/briglia-cli"]) if r["tag_name"] != "v0.1.58"]
+        full_page = healthy_others + [{"id": 10 + i, "tag_name": "v0.0.%d" % i, "draft": False, "immutable": True}
+                                      for i in range(100 - len(healthy_others))]
+        fake.faults["json_override"] = {LIST_P: full_page}
+        rc, out = run()
+        check("REPRO: full pages of healthy releases that never end (the flagged one omitted) → incomplete alert, "
+              "finding kept, NO recovery, run partial",
+              len(full_page) == 100 and NI in state()["active"] and ni_recoveries() == 0 and rc == 2
+              and any("release-list-incomplete" in m for m in fake.telegram)
+              and "not checked (briglia-cli)" in out and "did not end within the page limit" in out, out)
+        # A crash AFTER the list was fully and healthily interpreted: the
+        # crashed channel run withdraws its judgments, so nothing recovers.
+        del fake.faults["json_override"]
+        fake.releases["test/briglia-cli"][0]["immutable"] = True
+        broken = json.loads(json.dumps(cfg))
+        broken["channels"]["briglia-cli"]["installer_asset"] = 5   # TypeError after the list (config merges defaults)
+        json.dump(broken, open(cfg_path, "w"))
+        rc, out = run()
+        json.dump(cfg, open(cfg_path, "w"))
+        check("healthy complete list but the channel then crashes → watcher-error, NO recovery from the crashed run",
+              NI in state()["active"] and ni_recoveries() == 0 and "watcher raised TypeError" in out
+              and "published release(s) are immutable" in out, out)
+        rc, out = run()
+        check("complete, valid list and a clean channel run → release-not-immutable recovers exactly ONCE",
+              NI not in state()["active"] and ni_recoveries() == 1
+              and sum("recovered" in m and "release-list-incomplete" in m for m in fake.telegram) == 1, fake.telegram)
+        run(); fake.telegram.clear()
+        rc, out = run()
+        check("…and the next run is clean and silent", rc == 0 and not fake.telegram, out + str(fake.telegram))
         fake.releases["test/briglia-cli"].insert(0, {"id": 2, "tag_name": "scratch", "draft": True, "immutable": False})
         rc, out = run()
         check("a DRAFT on an odd tag (never immutable) → informational only, no tag/immutability alert",

@@ -137,6 +137,7 @@ DEFAULT_CONFIG = {
     # the Mac mini; Sentinel's installer starts it in report-only mode.
     "signing_audit_alerts": True,
     "audit_report_since": None,
+    "unverified_hold_hours": 0,
     "audits": True,
     "checker_website": True,
     "confirmations": False,
@@ -216,6 +217,10 @@ _RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 # signing_audit_alerts is false). The core checks — environment rules,
 # phone approval of every published release, envelope/sequence/
 # immutability, website installers — always alert.
+# "Unverified" (ambiguous, not proven bad) audit states: folded into the
+# daily status unless they persist beyond `unverified_hold_hours` (owner
+# anti-noise rule); definite findings alert at once.
+_HOLD_KEY_RE = re.compile(r"^[^/]+/(signing/|deploy-group-unverified/)")
 _AUDIT_KEY_RE = re.compile(r"^[^/]+/(signing(?:/|-audit-)|run-deleted/|deploy|baseline-|event|deletion-|"
                            r"coverage/(?:signing-audit|deployments|events|deletion)$)")
 
@@ -403,7 +408,8 @@ def _paged(cfg, path, key, params=None, max_pages=10, priority=2, stop=None):
         data = gh_json(cfg, path, p, max_bytes=MAX_PAGE_FETCH, priority=priority)
         chunk = data if key is None else (data.get(key) if isinstance(data, dict) else None)
         if not isinstance(chunk, list):
-            raise ShapeError("GitHub API %s: no %s list in the answer" % (path, repr(key) if key else "top-level"))
+            raise ShapeError("GitHub API %s → unexpected response shape (no %s list in the answer)"
+                             % (path, repr(key) if key else "top-level"))
         items += chunk
         if len(chunk) < 100 or (stop and stop(chunk)):
             return items
@@ -415,10 +421,12 @@ def resolve_tag(cfg, repo, tag, priority=2):
     ref = gh_json(cfg, "/repos/%s/git/ref/tags/%s" % (repo, tag), priority=priority, allow_404=True)
     if ref is None:
         return None
+    gh_shape(ref, dict, "ref " + tag)
     if ref.get("ref") != "refs/tags/" + tag:
         raise ShapeError("ref lookup answered %r for %s" % (ref.get("ref"), tag))
     obj = ref.get("object") or {}
     for _ in range(6):
+        gh_shape(obj, dict, "ref object " + tag)
         sha, typ = str(obj.get("sha", "")), obj.get("type")
         if not _SHA_RE.match(sha):
             raise ShapeError("malformed ref object for %s" % tag)
@@ -426,7 +434,8 @@ def resolve_tag(cfg, repo, tag, priority=2):
             return sha
         if typ != "tag":
             raise ShapeError("unexpected ref object type %r for %s" % (typ, tag))
-        obj = (gh_json(cfg, "/repos/%s/git/tags/%s" % (repo, sha), priority=priority).get("object")) or {}
+        obj = (gh_shape(gh_json(cfg, "/repos/%s/git/tags/%s" % (repo, sha), priority=priority), dict, "tag " + sha)
+               .get("object")) or {}
     raise ShapeError("annotated tag chain too deep for %s" % tag)
 
 
@@ -446,8 +455,19 @@ class Api:
         return resolve_tag(self.cfg, repo, tag, priority)
 
 
+def gh_shape(value, kind, path):
+    """A GitHub answer of the wrong JSON shape is a failed check (an error
+    finding, never a pass): validate before anything interprets it."""
+    if not isinstance(value, kind):
+        raise ShapeError("GitHub API %s → unexpected response shape (%s, expected %s)"
+                         % (path, type(value).__name__, kind.__name__))
+    return value
+
+
 def semver_tuple(version):
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version or "")
+    if not isinstance(version, str):
+        return None
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version)
     return tuple(int(x) for x in m.groups()) if m else None
 
 
@@ -857,6 +877,19 @@ class Run:
                     prev["text"] = text
                     self.report_log.append("STILL %s — %s" % (key, text))
                 continue
+            hold = float(cfg.get("unverified_hold_hours") or 0) * 3600
+            if hold and _HOLD_KEY_RE.match(key) and (prev is None or not prev.get("notified", True)):
+                if prev is None:
+                    prev = active[key] = {"first": now, "last_sent": now, "text": text, "notified": False, "held": True}
+                prev["text"] = text
+                if now - prev["first"] >= hold:
+                    prev["notified"] = True
+                    prev.pop("held", None)
+                    prev.pop("report_only", None)
+                    prev["last_sent"] = now
+                    messages.append("🚨 briglia release watch — %s (unverified for more than %.2f h, since %s)\n%s"
+                                    % (key, hold / 3600, iso(prev["first"]), text))
+                continue
             if key in self.transient:
                 if prev is None:
                     prev = active[key] = {"first": now, "last_sent": now, "text": text,
@@ -1027,7 +1060,7 @@ def corroborate_signed_run(cfg, chan, run, record, require_approval, channel=Non
     required = chan.get("required_jobs")
     if not path or not isinstance(required, list) or not required:
         return "config lacks workflow_path/required_jobs for this channel"
-    wf = gh_json(cfg, "/repos/%s/actions/workflows/%s" % (repo, os.path.basename(path)))
+    wf = gh_shape(gh_json(cfg, "/repos/%s/actions/workflows/%s" % (repo, os.path.basename(path))), dict, "workflow")
     wf_id = _int(wf.get("id"))
     if wf.get("path") != path or wf_id is None:
         return "workflow %s not found by path (answered path %r)" % (path, wf.get("path"))
@@ -1193,7 +1226,7 @@ def check_core(cfg, channel, run, now):
 
     # GitHub: latest release + tag → commit
     try:
-        latest = gh_json(cfg, "/repos/%s/releases/latest" % repo)
+        latest = gh_shape(gh_json(cfg, "/repos/%s/releases/latest" % repo), dict, "releases/latest")
         tag_commit = resolve_tag(cfg, repo, tag)
     except BudgetExhausted as exc:
         run.skipped(channel, "every GitHub-dependent check (%s)" % exc, "core")
@@ -1203,13 +1236,14 @@ def check_core(cfg, channel, run, now):
                   transient=is_network_error(exc))
         run.skipped(channel, "every GitHub-dependent check (GitHub unreachable)", "core")
         return None
-    run.judged(channel + "/latest-mismatch", channel + "/not-immutable")
     if latest.get("tag_name") != tag or latest.get("draft") is not False:
         run.alert(channel + "/latest-mismatch",
                   "GitHub 'latest' is %s (draft=%s) but the envelope served as latest is %s"
                   % (latest.get("tag_name"), latest.get("draft"), tag))
     if latest.get("immutable") is not True:
         run.alert(channel + "/not-immutable", "release %s is not immutable" % tag)
+    # judged only once both verdicts exist
+    run.judged(channel + "/latest-mismatch", channel + "/not-immutable")
     if not tag_commit:
         run.alert(channel + "/tag-missing", "refs/tags/%s does not exist" % tag)
         run.skipped(channel, "release record, list, assets, installer, website (tag missing)", "core")
@@ -1305,22 +1339,25 @@ def check_release_list(cfg, channel, run, ctx):
     tag = ctx["tag"]
     try:
         releases = _paged(cfg, "/repos/%s/releases" % repo, None, priority=4)
-        if any(not isinstance(r, dict) or not isinstance(r.get("draft"), bool) or "tag_name" not in r
-               for r in releases):
-            raise ShapeError("a release entry has an unexpected shape")
+        # every element is interpreted below: validate the whole shape first
+        for r in releases:
+            gh_shape(r, dict, "releases[]")
+            if "tag_name" not in r or not isinstance(r.get("draft"), bool):
+                raise ShapeError("GitHub API releases[] → unexpected response shape (tag_name/draft missing)")
     except BudgetExhausted as exc:
         run.skipped(channel, "release list (%s)" % exc, "release-list")
         return
     except WatchError as exc:
-        if not isinstance(exc, ShapeError):
+        if "more than" in str(exc) and "pages" in str(exc):
+            run.alert(channel + "/release-list-incomplete",
+                      "the release list did not end within the page limit — releases beyond it are NOT checked for tag "
+                      "shape, immutability or out-versioning latest")
+        else:
             run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc,
                       transient=is_network_error(exc))
         run.skipped(channel, "release list: latest-frozen, tag shape, immutability (cannot list releases: %s)" % exc,
                     "release-list")
         return
-    run.judged(channel + "/github-unreachable", channel + "/latest-frozen", channel + "/release-bad-tag",
-               channel + "/release-not-immutable", channel + "/release-list-incomplete")
-    run.performed(channel, "release-list")
     st = run.state.data
     if channel not in st.setdefault("confirmed_tags", {}):
         # first complete list: everything published so far is history the
@@ -1348,6 +1385,10 @@ def check_release_list(cfg, channel, run, ctx):
                   "published release(s) that are NOT immutable: %s" % ", ".join(sorted(mutable)))
     if releases and not bad_tags and not mutable:
         run.ok("all %d published release(s) are immutable with v<semver> tags" % len(published))
+    # judged only AFTER the complete, valid list was interpreted
+    run.judged(channel + "/github-unreachable", channel + "/latest-frozen", channel + "/release-bad-tag",
+               channel + "/release-not-immutable", channel + "/release-list-incomplete")
+    run.performed(channel, "release-list")
 
 
 def check_rest(cfg, channel, run, now, ctx):
@@ -1411,8 +1452,6 @@ def check_rest(cfg, channel, run, now, ctx):
         try:
             s1, _, released = fetch(rel_url)
             s2, _, source = fetch(src_url)
-            run.judged(channel + "/installer")
-            run.performed(channel, "installer")
             if s1 != 200 or s2 != 200:
                 run.alert(channel + "/installer", "installer fetch: release HTTP %s, source HTTP %s" % (s1, s2))
                 run.skipped(channel, "website installers (no verified released installer to compare)", "website")
@@ -1422,6 +1461,9 @@ def check_rest(cfg, channel, run, now, ctx):
                 run.skipped(channel, "website installers (no verified released installer to compare)", "website")
             else:
                 run.ok("released installer is byte-identical to %s@%s" % (chan["installer_source"], tag))
+            run.judged(channel + "/installer")
+            run.performed(channel, "installer")
+            if s1 == 200 and s2 == 200 and released == source:
                 rec = st["recorded"].get(channel)
                 if rec and rec.get("tag") == tag:
                     st.setdefault("installer_verified", {})[channel] = {
@@ -1487,14 +1529,14 @@ def check_rest(cfg, channel, run, now, ctx):
                       transient=is_network_error(exc))
 
     # expiry
-    run.judged(channel + "/expiry")
-    run.performed(channel, "expiry")
     days_left = (manifest["expires"] - now) / 86400
     if days_left < float(cfg["expiry_warning_days"]):
         run.alert(channel + "/expiry", "metadata for %s expires in %.1f days (%s) — publish a new release before clients refuse it"
                   % (tag, days_left, iso(manifest["expires"])))
     else:
         run.ok("metadata valid for another %.0f days" % days_left)
+    run.judged(channel + "/expiry")
+    run.performed(channel, "expiry")
 
 
 def check_channel(cfg, channel, run, now):
@@ -1757,9 +1799,17 @@ def cmd_check(cfg):
         for ch in channels:
             if ch not in crashed:
                 run.judged(ch + "/watcher-error")
-            if not run.missing(ch):
+            if not run.missing(ch) and ch not in crashed:
                 run.judged(ch + "/config-invalid")
+        for ch in crashed:
+            # A crashed channel run proves nothing: withdraw EVERY judgment
+            # this run made for that channel, so none of its findings is
+            # cleared ("recovered") by it. Findings it observed still alert.
+            run.checked = {k for k in run.checked if not k.startswith(ch + "/") or k in run.findings}
+            run.done.pop(ch, None)
         evaluate_coverage(cfg, run, now)
+        for ch in crashed:
+            run.checked = {k for k in run.checked if not k.startswith(ch + "/") or k in run.findings}
         site_gen = None
         if remote(cfg):
             site_gen = write_site_cache(cfg, st, now)
@@ -1780,8 +1830,9 @@ def cmd_check(cfg):
         if BUDGET.min_seen is not None:
             hist.append([now, BUDGET.min_seen, BUDGET.requests])
         del hist[:-60]
-        alerting = sorted(k for k, v in st["active"].items() if not v.get("report_only"))
+        alerting = sorted(k for k, v in st["active"].items() if not v.get("report_only") and not v.get("held"))
         report_open = sorted(k for k, v in st["active"].items() if v.get("report_only"))
+        held = sorted(k for k, v in st["active"].items() if v.get("held"))
         if not alerting and not partial and not preserved:
             st["last_clean"] = now
         prune_state(st)
@@ -1789,7 +1840,7 @@ def cmd_check(cfg):
         state.write_beacon({
             "version": WATCH_VERSION, "completed": now, "completed_total": st["completed_total"],
             "findings": len([k for k in run.findings if not run.is_report_only(k)]) + len(preserved),
-            "open": alerting, "report_only_open": report_open,
+            "open": alerting, "report_only_open": report_open, "held": held,
             "coverage_warnings": sorted(k for k in alerting if "/coverage/" in k),
             "partial": partial, "queued": len(st["queued"]), "oldest_queued": st.get("queued_since"),
             "recorded": {c: {"tag": r["tag"], "sequence": r["sequence"]} for c, r in st["recorded"].items()},
@@ -1859,6 +1910,8 @@ def main(argv=None):
     ap.add_argument("--config", help="JSON config overriding DEFAULT_CONFIG")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
+    global RETRY_DELAY
+    RETRY_DELAY = float(cfg.get("retry_delay_seconds", RETRY_DELAY))   # selftests shorten the in-run retry pause
     if remote(cfg):
         install_no_exec_hook("Sentinel's checker")
         rv._PROVIDER = ("python", None)      # never try the openssl subprocess
