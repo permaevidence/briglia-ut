@@ -61,7 +61,9 @@ jobs:
   # selftests above already run on both OSes.
   release-breaks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Each watcher break re-runs the full watch selftest (~5 min); with the
+    # five coverage breaks the job takes ~30 min, so allow 60.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Release-tooling deliberate breaks (each must turn its suite red)
