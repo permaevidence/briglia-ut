@@ -20,7 +20,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from signing_fixture import TestKey  # noqa: E402
-from watch_selftest import Fake, signed_run, jobs_ok, CLI_JOB_NAMES, APP_JOB_NAMES  # noqa: E402
+from watch_selftest import Fake, signed_run, jobs_ok, job_rec, CLI_JOB_NAMES, APP_JOB_NAMES  # noqa: E402
 
 PASSED = FAILED = 0
 REVIEWER = 4242001
@@ -72,14 +72,16 @@ def main():
     cfg_path = os.path.join(root, "cfg.json")
     json.dump({
         "state_dir": state_dir, "github_api": B + "/api", "raw_base": B + "/raw",
-        "telegram_env_file": tg_env, "telegram_api": B + "/tg", "transient_grace_checks": 1,
+        "telegram_env_file": tg_env, "telegram_api": B + "/tg", "transient_grace_checks": 1, "audits": False,
         "channels": {
-            "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "installer_asset": None,
+            "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "workflow_id": 77, "environment_ids": {"release-sign": ENV_ID}, "signing_cutoff": "2020-01-01T00:00:00Z",
+                            "legacy_pinned_executions": [],  "installer_asset": None,
                             "website_install_url": [], "legacy_blob_manifest": None,
                             "approval_required_above_sequence": 60, "approver_user_id": REVIEWER,
                             "envelope_url": B + "/latest/briglia-cli/manifest.sig.json",
                             "artifact_url_prefix": B + "/download/briglia-cli/v{version}/"},
-            "briglia-ut": {"kind": "app", "repo": "test/briglia-ut", "publication_log": pub_log,
+            "briglia-ut": {"kind": "app", "repo": "test/briglia-ut", "workflow_id": 77, "environment_ids": {"release-sign": ENV_ID}, "signing_cutoff": "2020-01-01T00:00:00Z",
+                            "legacy_pinned_executions": [],  "publication_log": pub_log,
                            "website_page_url": [], "legacy_blob_manifest": None,
                            "approval_required_above_sequence": 7, "approver_user_id": REVIEWER,
                            "envelope_url": B + "/latest/briglia-ut/manifest.sig.json",
@@ -141,16 +143,28 @@ def main():
     def last_run(chan):
         return fake.runs["test/" + chan][-1]
 
+    def forget(chan):
+        """Each scenario starts with a fresh observer: the review-history
+        evidence the watcher keeps per run attempt (a history can only grow
+        within one attempt) is dropped, so mutated fakes stay independent."""
+        p_ = os.path.join(state_dir, "state.json")
+        if os.path.exists(p_):
+            st_ = json.load(open(p_))
+            st_.get("audit", {}).pop(chan, None)
+            json.dump(st_, open(p_, "w"))
+
     def retry(chan, label, mutate, expect_text, ok_after=False):
         """Mutate the latest run's evidence, check the release stays
         unrecorded with `expect_text` in the alert, then restore."""
         fake.telegram.clear()
+        forget(chan)
         before = recorded(chan).get("sequence")
         saved = json.loads(json.dumps(last_run(chan)))
         mutate(last_run(chan))
         rc, out = run()
         check(label, rc == 2 and recorded(chan).get("sequence") == before
-              and any("uncorroborated" in m and expect_text in m for m in fake.telegram), (out[-800:], fake.telegram))
+              and expect_text in state()["active"].get(chan + "/uncorroborated-release", {}).get("text", ""),
+              (out[-800:], fake.telegram))
         fake.runs["test/" + chan][-1] = saved
 
     C = ["%040x" % (0xc0ffee + i) for i in range(40)]
@@ -167,38 +181,43 @@ def main():
         print("— CLI: approval bound to the single signing execution —")
         release("briglia-cli", "0.2.49", 61, C[2], run=cli_run(611, "0.2.49", 61, C[2], approvals=[approval()]))
         retry("briglia-cli", "above the cutoff with NO approval → not approved, not recorded",
-              lambda r: r.update(approvals=[]), "no approval for environment release-sign")
+              lambda r: r.update(approvals=[]), "SIGNED WITHOUT an approval for release-sign")
         retry("briglia-cli", "approval by ANOTHER user id with the SAME login → refused (stable id, never the login)",
-              lambda r: r.update(approvals=[approval(user_id=999)]), "not the configured reviewer id")
+              lambda r: r.update(approvals=[approval(user_id=999)]), "not the pinned reviewer id")
         retry("briglia-cli", "approval for a DIFFERENT environment id → refused",
-              lambda r: r.update(approvals=[approval(env_id=ENV_ID + 1)]), "no approval for environment")
+              lambda r: r.update(approvals=[approval(env_id=ENV_ID + 1)]), "SIGNED WITHOUT an approval")
         retry("briglia-cli", "a REJECTED entry for the signing environment next to an approval → not approved",
               lambda r: r.update(approvals=[approval(state="rejected"), approval()]), "rejected")
         retry("briglia-cli", "two approval entries for the signing environment → approval unverified",
-              lambda r: r.update(approvals=[approval(), approval()]), "approval unverified: 2 approval entries")
+              lambda r: r.update(approvals=[approval(), approval()]), "2 approval entries")
         retry("briglia-cli", "signing job ran in attempt 2 (re-run all jobs) → approval unverified",
-              lambda r: [j.update(run_attempt=2) for j in r["jobs"] if j["name"] == "Sign metadata"],
-              "approval unverified: the signing job ran in attempt 2")
+              lambda r: [j.update(run_attempt=2, started_at="2026-10-05T12:00:00Z") for j in r["jobs"] if j["name"] == "Sign metadata"]
+              + [r.update(run_attempt=2, approvals_by_attempt={"2": [approval()]})],
+              "executed in attempt 2")
         retry("briglia-cli", "two signing executions in one run → approval unverified",
-              lambda r: r["jobs"].append({"id": 7, "name": "Sign metadata", "conclusion": "success", "run_attempt": 2}),
-              "approval unverified: 2 signing execution")
+              lambda r: r["jobs"].append(job_rec(7, "Sign metadata", attempt=2, started="2026-10-05T12:00:00Z",
+                                                 completed="2026-10-05T12:00:30Z")) or r.update(run_attempt=2),
+              "2 signing executions")
         retry("briglia-cli", "review history with an unexpected shape → not approved",
               lambda r: r.update(approvals=[{"state": "approved", "environments": "release-sign", "user": {"id": REVIEWER}}]),
               "unexpected shape")
         fake.faults["approvals_status"] = 500
+        forget("briglia-cli")
         fake.telegram.clear()
         rc, out = run()
         check("review-history API error → not approved (never success), not recorded",
               rc == 2 and recorded("briglia-cli").get("sequence") == 60
               and any("uncorroborated" in m and "cannot verify" in m for m in fake.telegram), (out[-600:], fake.telegram))
         del fake.faults["approvals_status"]
-        fake.environments["test/briglia-cli"]["release-sign"] = {"id": ENV_ID, "name": "release-sign-OLD"}
-        fake.telegram.clear()
-        rc, out = run()
-        check("signing environment answering another name → approval unverified",
-              rc == 2 and recorded("briglia-cli").get("sequence") == 60 and any("approval unverified" in m for m in fake.telegram),
-              fake.telegram)
-        fake.environments["test/briglia-cli"]["release-sign"] = {"id": ENV_ID, "name": "release-sign"}
+        # Rehearsal 2026-10-06: a re-run REPLACES the run's review history.
+        # A run first seen already in attempt 2 has an attempt-1 history
+        # nobody observed: its attempt-1 signing cannot be bound to an
+        # approval → never accepted on what the history says now.
+        retry("briglia-cli", "run first seen in attempt 2 (history replaced by a re-run, attempt-1 history never observed) "
+              "→ approval unverified, never accepted",
+              lambda r: r.update(run_attempt=2, approvals_by_attempt={"2": []}), "never observed")
+        retry("briglia-cli", "…even when the attempt-2 history shows an approval (it belongs to attempt 2, not to the signing)",
+              lambda r: r.update(run_attempt=2, approvals_by_attempt={"2": [approval()]}), "never observed")
 
         print("— CLI: run identity and required jobs —")
         retry("briglia-cli", "same-named workflow at ANOTHER path → refused (never matched by display name)",
@@ -230,6 +249,7 @@ def main():
               rc == 2 and recorded("briglia-cli").get("sequence") == 60 and any("2 '" in m and "runs exist" in m for m in fake.telegram),
               fake.telegram)
         fake.runs["test/briglia-cli"].pop()
+        forget("briglia-cli")
         fake.telegram.clear()
         rc, out = run()
         rec = recorded("briglia-cli")
@@ -255,24 +275,40 @@ def main():
                                                               run_attempt=2))
         fake.telegram.clear()
         rc, out = run()
-        check("publish failed in attempt 1, re-run of the FAILED job only (attempt 2): the carried copy of the attempt-1 "
-              "signing is the SAME execution → one signing + one approval → recorded",
+        check("publish-only retry (attempt 2) whose attempt-1 review history was never observed (GitHub replaced it) → "
+              "approval unverified, not recorded — the carried copy is one execution, but no approval can be bound to it",
+              rc == 2 and recorded("briglia-cli").get("sequence") == 61
+              and any("never observed" in m for m in fake.telegram), (out[-600:], fake.telegram))
+        # the same retry, with the attempt-1 history OBSERVED before the
+        # retry (the signing audit's hourly look, simulated here by one run
+        # while the run was still in attempt 1)
+        p_ = os.path.join(state_dir, "state.json")
+        st_ = json.load(open(p_))
+        st_.setdefault("audit", {}).setdefault("briglia-cli", {}).setdefault("runs", {})["621"] = {
+            "approvals": {"1": [{"state": "approved", "user_id": REVIEWER, "login": "matteoiannius-beep"}]}}
+        json.dump(st_, open(p_, "w"))
+        fake.telegram.clear()
+        rc, out = run()
+        check("publish-only retry whose attempt-1 approval WAS observed before the retry: the carried copy is the SAME "
+              "execution → one signing + one observed approval → recorded",
               rc == 0 and recorded("briglia-cli").get("sequence") == 62
-              and recorded("briglia-cli").get("approval", {}).get("sign_job_id") == 6205, (out[-600:], fake.telegram))
+              and recorded("briglia-cli").get("approval", {}).get("execution", [None])[0] == "621", (out[-600:], fake.telegram))
         release("briglia-cli", "0.2.51", 63, C[10], run=cli_run(631, "0.2.51", 63, C[10], approvals=[approval()],
-                                                                jobs=[dict(j) for j in jobs_ok(CLI_JOB_NAMES, 6300)], run_attempt=2))
+                                                                jobs=[dict(j) for j in jobs_ok(CLI_JOB_NAMES, 6300)], run_attempt=1))
         for i, j in enumerate(last_run("briglia-cli")["jobs"]):
             j.update(started_at="2026-10-05T14:%02d:00Z" % i, completed_at="2026-10-05T14:%02d:30Z" % i,
                      runner_name="GitHub Actions %d" % (4000 + i))
         sign_a1 = next(j for j in last_run("briglia-cli")["jobs"] if j["name"] == "Sign metadata")
         last_run("briglia-cli")["jobs"].append(dict(sign_a1, id=sign_a1["id"] + 1, run_attempt=2,
                                                     started_at="2026-10-05T15:00:00Z"))
+        last_run("briglia-cli")["run_attempt"] = 2
         fake.telegram.clear()
         rc, out = run()
         check("a GENUINE second signing execution (re-run all jobs: new start time) → approval unverified, not recorded",
               rc == 2 and recorded("briglia-cli").get("sequence") == 62
-              and any("approval unverified: 2 signing execution" in m for m in fake.telegram), (out[-600:], fake.telegram))
+              and any("2 signing executions" in m for m in fake.telegram), (out[-600:], fake.telegram))
         last_run("briglia-cli")["jobs"].pop()
+        last_run("briglia-cli")["run_attempt"] = 1
         rc, out = run()
         check("…and with only the single attempt-1 signing it records", rc == 0 and recorded("briglia-cli").get("sequence") == 63, out[-400:])
 
@@ -303,7 +339,7 @@ def main():
               (out2[-600:], fake.telegram))
         release("briglia-ut", "0.8.7", 9, C[6], run=app_run(901, "0.8.7", 9, C[6], approvals=[]))
         retry("briglia-ut", "app CI release without an approval → not approved (no publication-log fallback)",
-              lambda r: None, "no approval")
+              lambda r: None, "WITHOUT an approval")
         retry("briglia-ut", "app CI release with the macOS reproducibility build SKIPPED → refused",
               lambda r: [j.update(conclusion="skipped") for j in r["jobs"] if j["name"] == "Build click (macOS, reproducibility)"]
               or r.update(approvals=[approval()]), "Build click (macOS, reproducibility): skipped")

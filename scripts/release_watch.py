@@ -1,101 +1,84 @@
 #!/usr/bin/env python3
-"""Deterministic release-channel watcher (briglia-cli RELEASE_SIGNING_PLAN.md §10).
+"""Deterministic release-channel watcher (briglia-cli RELEASE_SIGNING_PLAN.md §10;
+off-Mac watcher plan "Sentinel").
 
 Re-verifies the two signed channels — Briglia CLI and this app — the way a
 client would, then cross-checks what GitHub says about them, and alerts a
-human over Telegram on ANY mismatch or inability to verify. Success is
-silent. No LLM is involved: every judgement here is a byte, hash, number
-or string comparison against pinned keys and a locally recorded history.
+human over Telegram on ANY mismatch or inability to verify. No LLM is
+involved: every judgement here is a byte, hash, number or string comparison
+against pinned keys, pinned ids and a locally recorded history.
 
     release_watch.py check      [--config PATH]   # hourly
     release_watch.py status     [--config PATH]   # print the recorded state
     release_watch.py acknowledge-local CHANNEL TAG ENVELOPE_SHA256 [--config PATH]
         # owner-only: accept ONE break-glass local release as local provenance
+    release_watch.py acknowledge-finding KEY [--config PATH]
+        # owner-only: close one event-feed finding (a deleted tag, a feed gap)
+        # that no later check can ever clear by itself
+
+Two deployments run this same file:
+
+  * the Mac mini (mode "local", the default): authenticated with the
+    owner's gh token when GH_TOKEN is set, alerts through the Mac mini's
+    Telegram bot, corroborates pre-CI app releases with the local
+    publication log;
+  * Sentinel on Mac 2 (mode "remote"): NO credentials at all — no
+    Authorization header is ever sent, even if GH_TOKEN is set; an audit
+    hook refuses to start any process; Telegram credentials come only from
+    Sentinel's own 0600 telegram.env; it also writes the website cache for
+    the 5-minute site job (scripts/sentinel_site.py) and sends a positive
+    ✅ confirmation for every fully verified release.
 
 The watcher watching itself is a SEPARATE program, scripts/release_heartbeat.py
 (stdlib only, its own state and lock): it reads nothing from this module and
-nothing from state.json — only the completion beacon `check.beacon.json`
-that `check` writes atomically at the end of every completed run.
+nothing from state.json — only the completion beacon `check.beacon.json`.
 
-Per channel, `check`:
-  1. fetches `releases/latest/download/manifest.sig.json` (bounded) and
-     authenticates it with the PINNED key set (py/release_verify.py — the
-     same code the phone runs: signature, schema, channel, expiry, asset
-     URLs locked to the per-version release location);
-  2. compares it with the newest RECORDED authorized release: identical →
-     fine; strictly higher sequence → a candidate new release that must be
-     corroborated before it is recorded — and its recording is announced,
-     never silent; lower sequence → ROLLBACK alert; same sequence but any
-     difference → alert. Corroboration (UT signing-in-CI plan §3.3, both
-     channels, per-channel parameters): exactly one push run of the workflow
-     at `workflow_path` (matched by path + workflow id, never by display
-     name) for this tag at the recorded commit, completed/success, every
-     configured required job successful (a skipped required job fails);
-     above the channel's `approval_required_above_sequence` cutoff, the
-     signing job executed exactly once (run attempt 1 — a publish-only
-     "re-run failed jobs" attempt lists it again as a carried copy with the
-     same start/end/runner, which is the same execution) and the run's review
-     history holds exactly one approval for the signing environment's id,
-     by the configured reviewer's stable user id, and no rejection — any
-     error, missing field or ambiguity is "approval unverified", never
-     success. At or below the cutoff the release predates the approval
-     gate (CLI) or the CI pipeline (app: corroborated by the local
-     publication log, as before). Above the cutoff the app's local
-     publication log is never accepted: a break-glass local release is an
-     alert labelled "local provenance, not phone-approved CI" until the
-     owner runs `acknowledge-local`, and is then recorded as local
-     provenance, never as CI-approved;
-  3. asks the GitHub API: the latest release must be non-draft, immutable,
-     carry the manifest's tag, and refs/tags/<tag> must still resolve to the
-     recorded commit; no non-draft release may carry a higher version than
-     `latest` (a confused/frozen latest pointer); EVERY non-draft release
-     must be immutable and tagged v<major>.<minor>.<patch> (a release on any
-     other tag was not made by the pipeline, yet could be marked latest);
-  4. every asset in the manifest must be reachable at its immutable URL
-     with the authenticated size (Range probe, hourly); once a day, or
-     whenever the recorded release changes, every asset is downloaded in
-     full with the size bound and its SHA-256 compared;
-  5. CLI only: the released install.sh must be byte-identical to
-     scripts/get-briglia.sh at the exact release tag;
-  6. optional website checks, on EVERY configured hostname (the Vercel alias
-     and the real domain briglia.dev, so a domain/DNS-only hijack is seen):
-     the CLI install command must resolve (via redirect) to the released
-     installer bytes; the app page must link the exact click URL from the
-     app manifest;
-  7. optional transition check: a legacy Blob manifest still in service must
-     agree with the authoritative release;
-  8. metadata expiry within the warning window is an alert.
+Per channel, in priority order (a request budget guard stops low-priority
+work first when the unauthenticated GitHub allowance runs low):
+  1. environment rules of `release-sign` (watch_audit.check_env_rules);
+  2. the live envelope, authenticated with the PINNED key set
+     (py/release_verify.py), rollback floor, GitHub `latest` + tag → commit,
+     and corroboration of a new release: the pinned release workflow's run
+     with every required job successful and — above the channel's approval
+     cutoff — exactly one attempt-1 signing execution approved by the
+     pinned reviewer id for the pinned environment id;
+  3. the signing audit over EVERY run of the pinned workflow (watch_audit);
+  4. the complete release list (paginated): nothing newer than latest,
+     every published release immutable on a v<semver> tag; asset range
+     probes hourly and a full hash daily; the CLI installer equals
+     scripts/get-briglia.sh at the tag; optional website checks; expiry;
+  5. release-sign deployments as discovery pointers (count check);
+  6. the repository event feed (supplemental);
+  7. every 6 h: release-publish rules and rulesets;
+  8. a deletion re-check rotation.
 
-Alert policy: a finding is sent when it first appears and re-sent every
-`realert_hours` while it persists; when it clears, one recovery message is
-sent. Network-class findings (the endpoint could not be reached — timeout,
-DNS, connection error, HTTP 5xx/429 — as opposed to answering with
-something wrong) are retried within the run and only announced after
-`transient_grace_checks` consecutive failing checks; one that clears
-before then is never announced, so it gets no recovery message either. Undelivered Telegram messages are queued in the state file and
-retried on the next run.
+Coverage: every finding key belongs to a check; a finding is cleared — and
+"recovered" announced — ONLY when its check actually ran and passed in this
+run. A check that is due but did not run keeps every finding exactly as it
+was, and once it has had no real result for longer than its own limit a
+`<channel>/coverage/<check>` warning opens.
 
-Config (JSON; the installer writes the production one): see DEFAULT_CONFIG.
-State: <state_dir>/state.json under an exclusive lock — the recorded
-authorized releases (the per-channel rollback floor), alert bookkeeping,
-queued messages. It is security state, so it is written durably (tmp +
-fsync + rename + directory fsync) and every save first preserves the
-previous good copy as state.json.prev. On load, a missing/corrupt/
-malformed state.json is recovered from that copy (the damaged file is kept
-aside and the recovery is announced); if BOTH are unusable the check
-refuses to run with an empty memory — it sends one direct alert and exits
-1 instead, so the rollback floor is never silently discarded. Stdlib only.
+Alert policy: a finding is sent when it opens and once when it truly
+clears. The Mac mini additionally re-sends a persisting finding every
+`realert_hours` (Sentinel sets 0: never repeats). Network-class findings
+are announced only after `transient_grace_checks` consecutive failing
+checks. Findings of the signing-execution audit (signing, deployments,
+events) are REPORT-ONLY while `signing_audit_alerts` is false: they go to
+a local log and to the daily status as a count, never to Telegram.
+
+State: <state_dir>/state.json under an exclusive lock, written durably with
+a last-known-good copy (state.json.prev); if both are unusable the check
+refuses to run with an empty memory. Stdlib only.
 """
 
 import argparse
-import http.client
 import datetime
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
@@ -104,46 +87,68 @@ import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Checkout layout: scripts/ next to py/. Installed snapshot layout: py/ inside
-# the watcher's own directory (scripts/install_release_watch.sh).
+# Checkout layout: scripts/ next to py/. Installed layout: py/ inside the
+# watcher's own directory. -I (isolated mode) does not put the script's
+# directory on sys.path, so it is added explicitly — and only it.
 for _cand in (os.path.join(HERE, "py"), os.path.join(os.path.dirname(HERE), "py")):
     if os.path.isfile(os.path.join(_cand, "release_verify.py")):
         sys.path.insert(0, _cand)
         break
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 import release_verify as rv  # noqa: E402
+import watch_audit as audit  # noqa: E402
 
-WATCH_VERSION = "1"
+WATCH_VERSION = "2"
 USER_AGENT = "briglia-release-watch/" + WATCH_VERSION
 MAX_SMALL_FETCH = 512 * 1024          # envelopes, installers, API JSON, pages
 MAX_PAGE_FETCH = 4 * 1024 * 1024
 FULL_HASH_INTERVAL = 24 * 3600
-RELEASE_PAGE_SIZE = 100               # one page of /releases; a full page is reported as incomplete
+ENV_PUBLISH_INTERVAL = 6 * 3600
+BUDGET_RESERVE = 5
+MAX_QUEUED = 200
+MAX_RUNS_KEPT = 400                   # per channel, settled runs beyond this are forgotten (state stays bounded)
+LOG_MAX_BYTES = 1024 * 1024
+LOG_KEEP = 2
 
 # Every channel entry carries an explicit `kind` (cli | app). The kind — not
 # the channel NAME — selects the verification policy and the corroboration
-# path, and the pinned policy's channel must equal the config key; a stale
-# channel name therefore produces a loud config-invalid alert instead of a
-# silently skipped branch (rename plan §6).
+# path, and the pinned policy's channel must equal the config key.
 DEFAULT_CONFIG = {
+    "mode": "local",
     "state_dir": "~/.config/briglia-release-watch",
     "github_api": "https://api.github.com",
     "raw_base": "https://raw.githubusercontent.com",
     "telegram_env_file": "~/.claude/channels/telegram/.env",   # TELEGRAM_BOT_TOKEN, OWNER_CHAT_ID
     "telegram_api": "https://api.telegram.org",
     "realert_hours": 6,
+    "realert_on_change": True,
     # Network-class findings (GitHub/CDN timeouts, 5xx, DNS blips) are only
     # announced once they have persisted for this many consecutive checks;
     # integrity findings are always announced on the first check.
     "transient_grace_checks": 3,
     "heartbeat_max_age_hours": 3,
     "expiry_warning_days": 30,
+    # Coverage: a due check with no real result for longer than its limit
+    # opens <channel>/coverage/<check>.
+    "coverage_max_age_hours": 4,
+    "coverage_limits_hours": {"env-publish": 8.25, "asset-hash": 26, "deletion": 26},
+    # The signing-execution audit (signing, deployments, events) alerts on
+    # the Mac mini; Sentinel's installer starts it in report-only mode.
+    "signing_audit_alerts": True,
+    "audit_report_since": None,
+    "audits": True,
+    "checker_website": True,
+    "confirmations": False,
+    "log_file": None,
+    "check_minute": 23,
     "channels": {
         "briglia-cli": {
             "kind": "cli",
             "repo": "permaevidence/briglia-cli",
             "workflow_path": ".github/workflows/release-signed.yml",
-            # exact job names in briglia-cli's release-signed.yml; all must
-            # succeed (no weakening of the three public checks)
+            "workflow_id": 346353613,
+            # exact job names in briglia-cli's release-signed.yml; all must succeed
             "required_jobs": ["Authorize (credential-free)", "Build macOS arm64", "Build Linux x64",
                               "Build Linux arm64 (native)", "Assemble manifest", "Sign metadata",
                               "Verify candidate (macos)", "Verify candidate (linux)",
@@ -152,33 +157,51 @@ DEFAULT_CONFIG = {
                               "Verify public channel (linux-arm64)"],
             "signing_job": "Sign metadata",
             "signing_environment": "release-sign",
+            "environment_ids": {"release-sign": 20888059977, "release-publish": 20888060344},
             "approver_user_id": 338251426,          # matteoiannius-beep — stable id, never the login
             # v0.2.49 (sequence 109) was published before the approval gate
             # and stays recorded without an invented approval.
             "approval_required_above_sequence": 109,
+            # Signing audit, pre-gate history: executions that STARTED before
+            # this time (creation of gate deployment 6848519034), plus the
+            # pinned v0.2.49 execution, which started 3 s after it and had
+            # no approval (no gate yet). Exclusive deployment boundary.
+            "signing_cutoff": "2026-10-04T23:56:06Z",
+            "legacy_pinned_executions": [{
+                "run_id": 37244536754, "ref": "v0.2.49", "sha": "7dadfc5a7cc368a90a14b190daeafbde76560501",
+                "started_at": "2026-10-04T23:56:09Z", "completed_at": "2026-10-04T23:56:15Z",
+                "runner_name": "GitHub Actions 1000002358"}],
+            "deployment_boundary": {"id": 6848519034, "inclusive": False},
+            "rulesets_expected": ["protect-main", "protect-release-tags"],
             "installer_asset": "install.sh",
             "installer_source": "scripts/get-briglia.sh",
-            # Every URL is probed: the Vercel project alias AND the real
-            # domain, so a DNS/domain-only hijack of briglia.dev alerts too.
-            # A single string is still accepted (older configs).
             "website_install_url": ["https://briglia.vercel.app/install.sh",
                                     "https://briglia.dev/install.sh"],
+            "website_redirect": "https://github.com/permaevidence/briglia-cli/releases/latest/download/install.sh",
             "legacy_blob_manifest": None,
         },
         "briglia-ut": {
             "kind": "app",
             "repo": "permaevidence/briglia-ut",
             "workflow_path": ".github/workflows/release-signed.yml",
+            "workflow_id": 376207556,
             "required_jobs": ["Authorize (credential-free)", "Build click (Linux)",
                               "Build click (macOS, reproducibility)", "Assemble manifest", "Sign metadata",
                               "Verify candidate", "Publish immutable release", "Verify public channel"],
             "signing_job": "Sign metadata",
             "signing_environment": "release-sign",
+            "environment_ids": {"release-sign": 23565890221, "release-publish": 23565891678},
             "approver_user_id": 338251426,
             # v0.8.5 (sequence 7) and earlier were signed locally and keep
             # their local provenance; above it the publication log is never
             # accepted.
             "approval_required_above_sequence": 7,
+            # The app's gate deployment 6880207211 (v0.8.6) is itself the
+            # first phone-approved signing: inclusive boundary, empty baseline.
+            "signing_cutoff": "2026-10-06T09:16:12Z",
+            "legacy_pinned_executions": [],
+            "deployment_boundary": {"id": 6880207211, "inclusive": True},
+            "rulesets_expected": ["protect-main", "protect-release-tags"],
             "publication_log": "~/.briglia-release-keys/briglia-ut-publications.jsonl",
             "website_page_url": ["https://briglia.vercel.app/ubuntu-touch",
                                  "https://briglia.dev/ubuntu-touch"],
@@ -188,10 +211,13 @@ DEFAULT_CONFIG = {
 }
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-# The only tag shape the release pipeline ever publishes. Anything else on a
-# non-draft release is a release created outside the pipeline (the v* tag
-# ruleset does not cover it, yet it can be marked latest).
 _RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+# Finding keys of the signing-execution audit (report-only while
+# signing_audit_alerts is false). The core checks — environment rules,
+# phone approval of every published release, envelope/sequence/
+# immutability, website installers — always alert.
+_AUDIT_KEY_RE = re.compile(r"^[^/]+/(signing(?:/|-audit-)|run-deleted/|deploy|baseline-|event|deletion-|"
+                           r"coverage/(?:signing-audit|deployments|events|deletion)$)")
 
 
 def url_list(value):
@@ -215,6 +241,28 @@ def iso(ts):
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def local_hm(ts):
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def remote(cfg):
+    return cfg.get("mode") == "remote"
+
+
+class WatchError(Exception):
+    def __init__(self, message, transient=False):
+        super().__init__(message)
+        self.transient = transient
+
+
+class ShapeError(WatchError, ValueError):
+    """GitHub answered, but not in the documented shape."""
+
+
+class BudgetExhausted(WatchError, audit.BudgetStop):
+    """The GitHub request budget would drop below the reserve for this priority."""
+
+
 def fetch(url, max_bytes=MAX_SMALL_FETCH, headers=None, timeout=60, method="GET"):
     """Bounded fetch → (status, headers, bytes). Network errors raise."""
     h = {"User-Agent": USER_AGENT}
@@ -229,12 +277,6 @@ def fetch(url, max_bytes=MAX_SMALL_FETCH, headers=None, timeout=60, method="GET"
     except urllib.error.HTTPError as exc:
         body = exc.read(max_bytes + 1) if exc.fp else b""
         return exc.code, dict(exc.headers or {}), body[:max_bytes]
-
-
-class WatchError(Exception):
-    def __init__(self, message, transient=False):
-        super().__init__(message)
-        self.transient = transient
 
 
 RETRY_ATTEMPTS = 3
@@ -264,36 +306,205 @@ def with_retries(fn, attempts=None, delay=None):
             time.sleep(delay)
 
 
-def gh_json(cfg, path, params=None, max_bytes=MAX_SMALL_FETCH):
+# ------------------------------------------------------- budget + GitHub API
+
+class Budget:
+    """Unauthenticated GitHub allows 60 requests/hour per IP, shared with
+    whatever else uses that IP. Before every request the last seen
+    X-RateLimit-Remaining decides: priorities 1–2 (environment rules,
+    envelope/latest/tag) may use the whole allowance, everything else stops
+    at the reserve. Whatever is not reached is 'not checked', never 'clean'."""
+
+    def __init__(self):
+        self.remaining = self.reset = self.limit = self.min_seen = None
+        self.requests = 0
+
+    def observe(self, headers):
+        h = {str(k).lower(): v for k, v in (headers or {}).items()}
+        try:
+            rem = int(h["x-ratelimit-remaining"])
+        except (KeyError, ValueError, TypeError):
+            return
+        self.remaining = rem
+        self.min_seen = rem if self.min_seen is None else min(self.min_seen, rem)
+        for attr, name in (("reset", "x-ratelimit-reset"), ("limit", "x-ratelimit-limit")):
+            try:
+                setattr(self, attr, int(h[name]))
+            except (KeyError, ValueError, TypeError):
+                pass
+
+    def check(self, priority, reserve=BUDGET_RESERVE):
+        if self.remaining is None:
+            return
+        if self.reset is not None and now_ts() >= self.reset:
+            self.remaining = None      # a new window: the next answer tells
+            return
+        floor = 0 if priority <= 2 else reserve
+        if self.remaining <= floor:
+            raise BudgetExhausted("GitHub rate limit exhausted for this IP (%s of %s left, reserve %d for the core "
+                                  "checks; resets %s)" % (self.remaining, self.limit, floor,
+                                                          iso(self.reset) if self.reset else "?"))
+
+
+BUDGET = Budget()
+_TOKEN_WARNED = []
+
+
+def gh_json(cfg, path, params=None, max_bytes=MAX_SMALL_FETCH, priority=2, allow_404=False):
     url = cfg["github_api"] + path + ("?" + urllib.parse.urlencode(params) if params else "")
     headers = {"Accept": "application/vnd.github+json"}
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if token:
+    if remote(cfg):
+        # Remote mode is credential-free by construction: never an
+        # Authorization header, whatever the environment holds.
+        if token and not _TOKEN_WARNED:
+            _TOKEN_WARNED.append(1)
+            print("  ! GH_TOKEN/GITHUB_TOKEN is set but IGNORED: remote mode never sends credentials", file=sys.stderr)
+    elif token:
         headers["Authorization"] = "Bearer " + token
+
     def once():
+        BUDGET.check(priority)
         try:
-            st, _, b = fetch(url, max_bytes=max_bytes, headers=headers)
+            st, h, b = fetch(url, max_bytes=max_bytes, headers=headers)
         except WatchError:
             raise
         except Exception as exc:  # noqa: BLE001
             if is_network_error(exc):
                 raise WatchError("GitHub API %s → %s" % (path, exc), transient=True)
             raise
+        BUDGET.requests += 1
+        BUDGET.observe(h)
+        if st in (403, 429) and BUDGET.remaining == 0:
+            raise BudgetExhausted("GitHub rate limit exhausted for this IP (resets %s)"
+                                  % (iso(BUDGET.reset) if BUDGET.reset else "?"))
         if st >= 500 or st == 429:
             raise WatchError("GitHub API %s → HTTP %s" % (path, st), transient=True)
         return st, b
     status, body = with_retries(once)
+    if status == 404 and allow_404:
+        return None
     if status != 200:
         raise WatchError("GitHub API %s → HTTP %s" % (path, status))
     try:
         return json.loads(body.decode("utf-8"))
     except ValueError:
-        raise WatchError("GitHub API %s → invalid JSON" % path)
+        raise ShapeError("GitHub API %s → invalid JSON" % path)
+
+
+def _paged(cfg, path, key, params=None, max_pages=10, priority=2, stop=None):
+    """Every item of a paginated list endpoint (`key` names the list inside
+    an object answer; None = the answer is the list). An endpoint that never
+    ends within max_pages × 100 items is an error, never a silent truncation.
+    `stop(page_items)` may end the walk early (a known boundary reached)."""
+    items = []
+    for page in range(1, max_pages + 1):
+        p = dict(params or {}, per_page=100, page=page)
+        data = gh_json(cfg, path, p, max_bytes=MAX_PAGE_FETCH, priority=priority)
+        chunk = data if key is None else (data.get(key) if isinstance(data, dict) else None)
+        if not isinstance(chunk, list):
+            raise ShapeError("GitHub API %s: no %s list in the answer" % (path, repr(key) if key else "top-level"))
+        items += chunk
+        if len(chunk) < 100 or (stop and stop(chunk)):
+            return items
+    raise ShapeError("GitHub API %s: more than %d pages — refusing to judge a truncated list" % (path, max_pages))
+
+
+def resolve_tag(cfg, repo, tag, priority=2):
+    """Commit a tag names, following annotated tags; None if the tag is absent."""
+    ref = gh_json(cfg, "/repos/%s/git/ref/tags/%s" % (repo, tag), priority=priority, allow_404=True)
+    if ref is None:
+        return None
+    if ref.get("ref") != "refs/tags/" + tag:
+        raise ShapeError("ref lookup answered %r for %s" % (ref.get("ref"), tag))
+    obj = ref.get("object") or {}
+    for _ in range(6):
+        sha, typ = str(obj.get("sha", "")), obj.get("type")
+        if not _SHA_RE.match(sha):
+            raise ShapeError("malformed ref object for %s" % tag)
+        if typ == "commit":
+            return sha
+        if typ != "tag":
+            raise ShapeError("unexpected ref object type %r for %s" % (typ, tag))
+        obj = (gh_json(cfg, "/repos/%s/git/tags/%s" % (repo, sha), priority=priority).get("object")) or {}
+    raise ShapeError("annotated tag chain too deep for %s" % tag)
+
+
+class Api:
+    """What watch_audit.py may call — nothing else."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def get(self, path, params=None, priority=3, allow_404=False):
+        return gh_json(self.cfg, path, params, max_bytes=MAX_PAGE_FETCH, priority=priority, allow_404=allow_404)
+
+    def paged(self, path, key, params=None, priority=3, stop=None):
+        return _paged(self.cfg, path, key, params, priority=priority, stop=stop)
+
+    def tag_commit(self, repo, tag, priority=3):
+        return resolve_tag(self.cfg, repo, tag, priority)
 
 
 def semver_tuple(version):
     m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version or "")
     return tuple(int(x) for x in m.groups()) if m else None
+
+
+# --------------------------------------------------- isolation (remote mode)
+
+_BLOCKED_EVENTS = ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork",
+                   "os.forkpty", "pty.spawn", "os.startfile")
+
+
+def install_no_exec_hook(program):
+    """Refuse every attempt to start a process for the rest of this
+    interpreter's life (sys.addaudithook cannot be removed)."""
+    def hook(event, args):
+        if event in _BLOCKED_EVENTS:
+            raise PermissionError("%s never starts processes (blocked %s)" % (program, event))
+    sys.addaudithook(hook)
+
+
+class RotatingStream:
+    """stdout/stderr replacement: appends to `path`, and once the file
+    passes LOG_MAX_BYTES it is rotated (path → path.1 → path.2, the oldest
+    dropped). Logs therefore stay below about 3 MB in total."""
+
+    def __init__(self, path, max_bytes=LOG_MAX_BYTES, keep=LOG_KEEP):
+        self.path, self.max_bytes, self.keep = path, max_bytes, keep
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+
+    def _rotate(self):
+        try:
+            if os.path.getsize(self.path) < self.max_bytes:
+                return
+        except OSError:
+            return
+        for i in range(self.keep, 0, -1):
+            src = self.path if i == 1 else "%s.%d" % (self.path, i - 1)
+            if os.path.exists(src):
+                os.replace(src, "%s.%d" % (self.path, i))
+
+    def write(self, text):
+        self._rotate()
+        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+def rotating_append(path, line):
+    RotatingStream(path).write(line if line.endswith("\n") else line + "\n")
+
+
+def setup_logging(cfg):
+    if cfg.get("log_file"):
+        stream = RotatingStream(os.path.expanduser(cfg["log_file"]))
+        sys.stdout = sys.stderr = stream
 
 
 # ------------------------------------------------------------------ state
@@ -310,6 +521,17 @@ def _fsync_dir(path):
         os.close(fd)
 
 
+def atomic_json(path, data, indent=None):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=indent, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(path))
+
+
 def validate_state(data):
     """Raise ValueError unless `data` has the shape the watcher relies on.
     Valid JSON of the wrong shape is as dangerous as garbage: a string
@@ -317,7 +539,7 @@ def validate_state(data):
     if not isinstance(data, dict):
         raise ValueError("top level is not an object")
     for key, typ in (("recorded", dict), ("full_hash_at", dict), ("active", dict),
-                     ("queued", list), ("announced", dict)):
+                     ("queued", list), ("announced", dict), ("audit", dict), ("coverage", dict)):
         if key in data and not isinstance(data[key], typ):
             raise ValueError("%s is not a %s" % (key, typ.__name__))
     for channel, rec in data.get("recorded", {}).items():
@@ -344,6 +566,13 @@ def validate_state(data):
     if not isinstance(acks, dict) or any(not isinstance(v, dict) or any(not isinstance(t, str) or not isinstance(h, str)
                                                                          for t, h in v.items()) for v in acks.values()):
         raise ValueError("local_acks malformed")
+    for channel, aud in data.get("audit", {}).items():
+        if not isinstance(aud, dict) or not isinstance(aud.get("runs", {}), dict):
+            raise ValueError("audit[%s] malformed" % channel)
+        b = aud.get("baseline")
+        if b is not None and (not isinstance(b, dict) or not isinstance(b.get("executions"), list)
+                              or not isinstance(b.get("complete"), bool)):
+            raise ValueError("audit[%s].baseline malformed" % channel)
 
 
 class State:
@@ -395,7 +624,6 @@ class State:
                     self.recovered = ("state.json was unusable (%s); recovered from the last-known-good copy state.json.prev; "
                                       "the damaged file is kept as %s" % (primary, os.path.basename(aside)))
             elif os.path.exists(self.prev_path):
-                # a crash between the two renames in save() leaves only .prev
                 try:
                     self.data = self._load(self.prev_path)
                 except Exception as exc:  # noqa: BLE001
@@ -414,6 +642,10 @@ class State:
         self.data.setdefault("active", {})       # finding key → {"first": ts, "last_sent": ts, "text": ...}
         self.data.setdefault("queued", [])       # undelivered messages
         self.data.setdefault("announced", {})    # channel → last announced sequence
+        self.data.setdefault("coverage", {})     # "<channel>/<check>" → last real result
+        # pre-v2 per-channel coverage entries ("briglia-cli": ts) are dropped
+        for k in [k for k in self.data["coverage"] if "/" not in k]:
+            self.data["coverage"].pop(k)
         return self
 
     def save(self):
@@ -428,7 +660,6 @@ class State:
             f.flush()
             os.fsync(f.fileno())
         if os.path.exists(self.path):
-            # hard-link, then rename over .prev: state.json stays present throughout
             prev_tmp = self.prev_path + ".tmp"
             if os.path.exists(prev_tmp):
                 os.unlink(prev_tmp)
@@ -438,30 +669,59 @@ class State:
         os.replace(tmp, self.path)
         _fsync_dir(self.dir)
 
-    def write_beacon(self, now, findings, queued, oldest_queued):
+    def write_beacon(self, beacon):
         """The completion beacon read by release_heartbeat.py — written only
         after the state itself has been saved. Atomic, fsynced."""
-        path = os.path.join(self.dir, "check.beacon.json")
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"version": WATCH_VERSION, "completed": now, "findings": findings,
-                       "queued": queued, "oldest_queued": oldest_queued}, f, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        _fsync_dir(self.dir)
+        atomic_json(os.path.join(self.dir, "check.beacon.json"), beacon)
 
     def __exit__(self, *exc):
         if self.lock_fd is not None:
             fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
             os.close(self.lock_fd)
+            self.lock_fd = None
+
+
+def prune_state(st):
+    """Keep the state file bounded: settled run records beyond the newest
+    MAX_RUNS_KEPT per channel are forgotten (a forgotten run that changes
+    again is simply validated as new), job caches are kept only for open
+    runs, settled deployments only for the newest 200."""
+    for aud in (st.get("audit") or {}).values():
+        runs = aud.get("runs") or {}
+        for rid, rs in runs.items():
+            if rs.get("validated_fp") and rs.get("sig_cache"):
+                rs.pop("sig_cache", None)
+        settled = sorted((int(r) for r, rs in runs.items() if rs.get("validated_fp") and rs.get("verdict") != "unverified"
+                          and not rs.get("deleted")), reverse=True)
+        for rid in settled[MAX_RUNS_KEPT:]:
+            runs.pop(str(rid), None)
+        deps = aud.get("deployments") or {}
+        sd = sorted((int(d) for d, i in deps.items() if i.get("settled") and not i.get("deleted")), reverse=True)
+        for did in sd[200:]:
+            deps.pop(str(did), None)
+    for tags in (st.get("confirmed_tags") or {}).values():
+        del tags[:-500]
 
 
 # --------------------------------------------------------------- telegram
 
+def check_remote_telegram_env(path):
+    """Remote mode: Sentinel's own 0600 file, owned by this user, never the
+    Mac mini's Claude Code bot credentials."""
+    real = os.path.realpath(path)
+    if "/.claude/" in real + "/" or real.endswith("/.claude"):
+        raise WatchError("remote mode refuses the Claude Code Telegram credentials (%s) — Sentinel uses its own bot" % path)
+    st = os.stat(real)
+    if st.st_mode & 0o077:
+        raise WatchError("telegram env file %s is readable by others (mode %o) — refusing; it must be 0600" % (path, st.st_mode & 0o777))
+    if st.st_uid != os.geteuid():
+        raise WatchError("telegram env file %s is not owned by this user — refusing" % path)
+
+
 def telegram_credentials(cfg):
     path = os.path.expanduser(cfg["telegram_env_file"])
+    if remote(cfg):
+        check_remote_telegram_env(path)
     token = chat = None
     with open(path) as f:
         for line in f:
@@ -509,6 +769,10 @@ def _scrub(text, cfg):
 
 # ------------------------------------------------------------ findings
 
+def audit_report_only(cfg):
+    return cfg.get("signing_audit_alerts") is False
+
+
 class Run:
     """Collects findings for one `check` run and turns them into messages."""
 
@@ -518,23 +782,36 @@ class Run:
         self.findings = {}   # key → text (ALERT level)
         self.transient = set()  # keys whose finding is network-class only
         self.infos = []      # one-off informational messages
+        self.extra_messages = []   # composed elsewhere (confirmations), sent with the rest
         # Coverage: a finding is cleared — and "recovered" announced — ONLY
         # when the check that owns its key actually ran in this run and
-        # passed. `checked` holds every key judged this run (pass or fail);
-        # a key that was not judged (early return, upstream network failure,
-        # not due) keeps its active finding exactly as it was. `partial`
-        # lists, per channel, due work that was not performed.
+        # passed. `checked` holds every key judged this run (pass or fail).
         self.checked = set()
-        self.partial = {}    # channel → [reason, ...]
+        self.partial = {}    # channel → [reason, ...]  (due work not performed)
+        self.due = {}        # channel → {check, ...}
+        self.done = {}       # channel → {check, ...}
+        self.report_log = []
 
     def judged(self, *keys):
         """The checks owning these finding keys ran to a verdict in this run."""
         self.checked.update(keys)
 
-    def skipped(self, channel, reason):
+    def make_due(self, channel, *checks):
+        self.due.setdefault(channel, set()).update(checks)
+
+    def performed(self, channel, *checks):
+        self.done.setdefault(channel, set()).update(checks)
+
+    def skipped(self, channel, reason, *checks):
         """Due work for `channel` was not performed in this run."""
         print("  ⋯ not checked (%s): %s" % (channel, reason))
         self.partial.setdefault(channel, []).append(reason)
+        self.reasons = getattr(self, "reasons", {})
+        for c in checks:
+            self.reasons.setdefault((channel, c), []).append(reason)
+
+    def missing(self, channel):
+        return sorted(self.due.get(channel, set()) - self.done.get(channel, set()))
 
     def preserved(self):
         """Active, announced findings that this run neither re-found nor
@@ -558,16 +835,28 @@ class Run:
     def ok(self, text):
         print("  ✔ %s" % text)
 
+    def is_report_only(self, key):
+        return audit_report_only(self.cfg) and bool(_AUDIT_KEY_RE.match(key))
+
     def flush(self, now):
         """Decide what to send, send it, update bookkeeping. Returns the
         list of messages actually composed (sent or queued)."""
         cfg, st = self.cfg, self.state.data
-        realert = float(cfg["realert_hours"]) * 3600
+        realert = float(cfg.get("realert_hours") or 0) * 3600
+        on_change = cfg.get("realert_on_change", True) is not False
         grace = max(1, int(cfg.get("transient_grace_checks", 3)))
         messages = []
         active = st["active"]
         for key, text in self.findings.items():
             prev = active.get(key)
+            if self.is_report_only(key):
+                if prev is None:
+                    active[key] = {"first": now, "last_sent": now, "text": text, "notified": False, "report_only": True}
+                    self.report_log.append("OPEN  %s — %s" % (key, text))
+                elif prev.get("text") != text:
+                    prev["text"] = text
+                    self.report_log.append("STILL %s — %s" % (key, text))
+                continue
             if key in self.transient:
                 if prev is None:
                     prev = active[key] = {"first": now, "last_sent": now, "text": text,
@@ -577,26 +866,28 @@ class Run:
                     prev["text"] = text
                     if prev["count"] >= grace:
                         prev["notified"] = True
+                        prev.pop("report_only", None)
                         prev["last_sent"] = now
                         messages.append("🚨 briglia release watch — %s (failing for %d consecutive checks since %s)\n%s"
                                         % (key, prev["count"], iso(prev["first"]), text))
-                elif now - prev["last_sent"] >= realert:
-                    # the exact network error varies run to run; only time re-alerts
+                elif realert and now - prev["last_sent"] >= realert:
                     prev["last_sent"] = now
                     prev["text"] = text
                     messages.append("🚨 briglia release watch — STILL FAILING since %s — %s\n%s"
                                     % (iso(prev["first"]), key, text))
                 continue
             if prev is not None and not prev.get("notified", True):
-                prev = None   # a quiet network-class entry became a real finding: announce now
+                prev = None   # a quiet (network-class or report-only) entry became an alerting finding: announce now
             if prev is None:
                 active[key] = {"first": now, "last_sent": now, "text": text}
                 messages.append("🚨 briglia release watch — %s\n%s" % (key, text))
-            elif now - prev["last_sent"] >= realert or prev.get("text") != text:
+            elif (realert and now - prev["last_sent"] >= realert) or (on_change and prev.get("text") != text):
                 prev["last_sent"] = now
                 prev["text"] = text
                 messages.append("🚨 briglia release watch — STILL FAILING since %s — %s\n%s"
                                 % (iso(prev["first"]), key, text))
+            else:
+                prev["text"] = text
         for key in list(active):
             if key not in self.findings:
                 if key not in self.checked:
@@ -605,18 +896,29 @@ class Run:
                     # never a recovery, never a reset.
                     continue
                 gone = active.pop(key)
+                if gone.get("report_only"):
+                    self.report_log.append("CLEAR %s (open since %s)" % (key, iso(gone["first"])))
                 if not gone.get("notified", True):
                     continue   # never announced, so no recovery message
                 first = gone["first"]
                 messages.append("✅ briglia release watch — recovered: %s (failing since %s)" % (key, iso(first)))
         for text in self.infos:
             messages.append("ℹ️ briglia release watch — %s" % text)
+        messages += self.extra_messages
+        if self.report_log:
+            path = os.path.join(self.state.dir, "audit-report.log")
+            for line in self.report_log:
+                rotating_append(path, "%s %s" % (iso(now), line))
         # deliver queued first (oldest), then new; keep whatever fails
         pending = list(st["queued"]) + messages
         st["queued"] = []
         for m in pending:
             if not send_telegram(cfg, m):
                 st["queued"].append(m)
+        if len(st["queued"]) > MAX_QUEUED:
+            dropped = len(st["queued"]) - MAX_QUEUED
+            st["queued"] = ["⚠️ briglia release watch — %d older undelivered message(s) were dropped to keep the "
+                            "queue bounded" % dropped] + st["queued"][-(MAX_QUEUED - 1):]
         if st["queued"]:
             st.setdefault("queued_since", now)   # reported through the beacon to the heartbeat
         else:
@@ -669,29 +971,6 @@ def manifest_record(manifest, envelope_raw, tag_commit):
     }
 
 
-def resolve_tag(cfg, repo, tag):
-    """Commit a tag names, following annotated tags; None if the tag is absent."""
-    try:
-        ref = gh_json(cfg, "/repos/%s/git/ref/tags/%s" % (repo, tag))
-    except WatchError as exc:
-        if "HTTP 404" in str(exc):
-            return None
-        raise
-    if ref.get("ref") != "refs/tags/" + tag:
-        raise WatchError("ref lookup answered %r for %s" % (ref.get("ref"), tag))
-    obj = ref.get("object") or {}
-    for _ in range(6):
-        sha, typ = str(obj.get("sha", "")), obj.get("type")
-        if not _SHA_RE.match(sha):
-            raise WatchError("malformed ref object for %s" % tag)
-        if typ == "commit":
-            return sha
-        if typ != "tag":
-            raise WatchError("unexpected ref object type %r for %s" % (typ, tag))
-        obj = (gh_json(cfg, "/repos/%s/git/tags/%s" % (repo, sha)).get("object")) or {}
-    raise WatchError("annotated tag chain too deep for %s" % tag)
-
-
 def probe_asset_checked(url, size):
     """probe_asset, but a 5xx/429 answer raises (retryable) instead of
     being reported as a size problem."""
@@ -722,37 +1001,27 @@ def probe_asset(url, size):
 
 
 def full_hash(url, size, sha256):
+    # delete-on-close: the download never outlives this call
     with tempfile.NamedTemporaryFile(prefix="briglia-watch-", delete=True) as tmp:
         err = rv.download_to_file(url, tmp.name, size, sha256, timeout=600)
     return err
-
-
-def _paged(cfg, path, key, params=None, max_pages=10):
-    """Every item of a paginated list endpoint; an endpoint that never ends
-    within max_pages × 100 items is an error, never a silent truncation."""
-    items = []
-    for page in range(1, max_pages + 1):
-        p = dict(params or {}, per_page=100, page=page)
-        data = gh_json(cfg, path, p, max_bytes=MAX_PAGE_FETCH)
-        chunk = data.get(key) if isinstance(data, dict) else None
-        if not isinstance(chunk, list):
-            raise WatchError("GitHub API %s: no %r list in the answer" % (path, key))
-        items += chunk
-        if len(chunk) < 100:
-            return items
-    raise WatchError("GitHub API %s: more than %d pages — refusing to judge a truncated list" % (path, max_pages))
 
 
 def _int(value):
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def corroborate_signed_run(cfg, chan, run, record, require_approval):
+API = None
+
+
+def corroborate_signed_run(cfg, chan, run, record, require_approval, channel=None, now=None):
     """The release-signed workflow run for this exact tag commit (plan
     §3.3): identity by repository + workflow path + workflow id, every
-    required job successful, and — above the cutoff — approval evidence
-    bound to the run's single signing execution. Returns None when
-    corroborated (and annotates `record`), else the reason."""
+    required job successful, and — above the cutoff — the signing audit's
+    validation of that run must say 'approved' (one attempt-1 signing
+    execution, one approval by the pinned reviewer id for the pinned
+    environment id, observed in attempt 1's review history). Returns None
+    when corroborated (and annotates `record`), else the reason."""
     repo, tag, commit = chan["repo"], record["tag"], record["commit"]
     path = chan.get("workflow_path") or ""
     required = chan.get("required_jobs")
@@ -762,6 +1031,8 @@ def corroborate_signed_run(cfg, chan, run, record, require_approval):
     wf_id = _int(wf.get("id"))
     if wf.get("path") != path or wf_id is None:
         return "workflow %s not found by path (answered path %r)" % (path, wf.get("path"))
+    if _int(chan.get("workflow_id")) is not None and wf_id != chan["workflow_id"]:
+        return "workflow %s has id %d, pinned %d (recreated workflow)" % (path, wf_id, chan["workflow_id"])
     runs = _paged(cfg, "/repos/%s/actions/workflows/%d/runs" % (repo, wf_id), "workflow_runs",
                   {"event": "push", "branch": tag})
     for_tag = [r for r in runs if r.get("head_branch") == tag and r.get("event") == "push"]
@@ -802,71 +1073,25 @@ def corroborate_signed_run(cfg, chan, run, record, require_approval):
     record["workflow_run"] = rid
     if not require_approval:
         return None
-
-    # --- approval bound to the single signing execution
-    sign_name = chan.get("signing_job") or ""
-    # A "Re-run failed jobs" attempt lists every job it did NOT re-run as a
-    # carried copy: a NEW job id with the new run_attempt, but the original
-    # execution's started_at, completed_at and runner (observed in the
-    # rehearsal, 2026-10-05). One EXECUTION is therefore keyed by those three
-    # fields; a record lacking any of them counts as its own execution
-    # (conservative). The execution's earliest record carries its real attempt.
-    executions = {}
-    for j in jobs:
-        if j.get("name") != sign_name:
-            continue
-        key = (j.get("started_at"), j.get("completed_at"), j.get("runner_name"))
-        if not all(isinstance(k, str) and k for k in key):
-            key = ("job-id", _int(j.get("id")), id(j))
-        executions.setdefault(key, []).append(j)
-    if len(executions) != 1:
-        return ("approval unverified: %d signing execution(s) of '%s' in run %s — one approval cannot be bound "
-                "to more than one signing attempt" % (len(executions), sign_name, rid))
-    records = next(iter(executions.values()))
-    sign = min(records, key=lambda j: (_int(j.get("run_attempt")) or 0, _int(j.get("id")) or 0))
-    if any(r.get("conclusion") != sign.get("conclusion") for r in records):
-        return "approval unverified: copies of the signing job disagree on its conclusion"
-    if _int(sign.get("run_attempt")) != 1 or sign.get("conclusion") != "success":
-        return ("approval unverified: the signing job ran in attempt %r (%s) — only a successful attempt-1 "
-                "signing is bound to the run's approval" % (sign.get("run_attempt"), sign.get("conclusion")))
-    env_name = chan.get("signing_environment") or ""
-    env = gh_json(cfg, "/repos/%s/environments/%s" % (repo, env_name))
-    env_id = _int(env.get("id"))
-    if env.get("name") != env_name or env_id is None:
-        return "approval unverified: environment %r answered name %r id %r" % (env_name, env.get("name"), env.get("id"))
-    approvals = gh_json(cfg, "/repos/%s/actions/runs/%d/approvals" % (repo, rid))
-    if not isinstance(approvals, list):
-        return "not approved: the review history is not a list (unexpected API shape)"
-    mine = []
-    for a in approvals:
-        if not isinstance(a, dict) or not isinstance(a.get("environments"), list) \
-                or not isinstance(a.get("user"), dict) or not isinstance(a.get("state"), str):
-            return "not approved: a review-history entry has an unexpected shape"
-        ids = [_int((e or {}).get("id")) if isinstance(e, dict) else None for e in a["environments"]]
-        if None in ids:
-            return "not approved: a review-history environment has no id"
-        if env_id in ids:
-            mine.append(a)
-    if any(a["state"] != "approved" for a in mine):
-        return "not approved: the review history holds a %s entry for %s" % (
-            "/".join(sorted({a["state"] for a in mine if a["state"] != "approved"})), env_name)
-    if not mine:
-        return "not approved: no approval for environment %s (id %d) in run %s" % (env_name, env_id, rid)
-    if len(mine) > 1:
-        return "approval unverified: %d approval entries for %s in run %s" % (len(mine), env_name, rid)
-    user = mine[0]["user"]
-    want = _int(chan.get("approver_user_id"))
-    if want is None or _int(user.get("id")) != want:
-        return "not approved: the approval is by user id %r (%s), not the configured reviewer id %r" % (
-            user.get("id"), user.get("login"), chan.get("approver_user_id"))
-    record["approval"] = {"user_id": want, "login": user.get("login"), "environment_id": env_id,
-                          "sign_job_id": _int(sign.get("id")), "run_attempt": 1}
+    # --- approval: the signing audit's own validation of this run
+    aud = audit.channel_audit(run.state.data, channel)
+    chan_v = dict(chan, workflow_id=wf_id)
+    res = audit.validate_run(Api(cfg), cfg, chan_v, r, aud, now if now is not None else now_ts())
+    if res["verdict"] == "reopen":
+        return "approval unverified: %s" % res["reason"]
+    audit.store_result(aud, r, res, now if now is not None else now_ts())
+    if res["verdict"] != "approved":
+        return "approval unverified: %s" % res["reason"]
+    record["approval"] = res["approval"]
     return None
 
 
 def corroborate_app(cfg, chan, run, record):
     """The local publisher recorded exactly this release (publish_click.sh
-    writes the log only after its own public re-verification)."""
+    writes the log only after its own public re-verification). Remote mode
+    has no publication log by design."""
+    if remote(cfg):
+        return "remote mode has no local publication log"
     path = os.path.expanduser(chan.get("publication_log") or "")
     if not path or not os.path.exists(path):
         return "no local publication log at %s — cannot corroborate a new app release" % (path or "<unset>")
@@ -903,7 +1128,7 @@ def check_website_installers(run, channel, chan, released):
         site_urls = url_list(chan.get("website_install_url"))
     except WatchError as exc:
         run.alert(channel + "/config-invalid", str(exc))
-        run.skipped(channel, "website installers (config invalid)")
+        run.skipped(channel, "website installers (config invalid)", "website")
         return
     site_bad, site_net = [], True
     for site_url in site_urls:
@@ -923,7 +1148,10 @@ def check_website_installers(run, channel, chan, released):
         run.alert(channel + "/website-installer", "; ".join(site_bad), transient=site_net)
 
 
-def check_channel(cfg, channel, run, now):
+def check_core(cfg, channel, run, now):
+    """Envelope, rollback, GitHub latest + tag, record comparison and
+    corroboration (priority 2). Returns the context the later checks need,
+    or None after an early return (everything after it is not checked)."""
     chan = cfg["channels"][channel]
     repo = chan["repo"]
     st = run.state.data
@@ -933,8 +1161,8 @@ def check_channel(cfg, channel, run, now):
         kind = channel_kind(cfg, channel)
     except WatchError as exc:
         run.alert(channel + "/config-invalid", str(exc))
-        run.skipped(channel, "every check (config invalid)")
-        return
+        run.skipped(channel, "every check (config invalid)", "core")
+        return None
 
     # 1. authenticate the live envelope
     try:
@@ -942,15 +1170,15 @@ def check_channel(cfg, channel, run, now):
     except Exception as exc:  # noqa: BLE001
         run.alert(channel + "/envelope-unreachable", "cannot fetch %s: %s" % (policy.envelope_url, exc),
                   transient=is_network_error(exc))
-        run.skipped(channel, "every check after the envelope fetch (envelope unreachable)")
-        return
+        run.skipped(channel, "every check after the envelope fetch (envelope unreachable)", "core")
+        return None
     run.judged(channel + "/envelope-unreachable")
     try:
         manifest = rv.verify_envelope(raw, policy, now)
     except rv.ReleaseVerifyError as exc:
         run.alert(channel + "/envelope-invalid", "live envelope REJECTED (%s): %s" % (exc.kind, exc))
-        run.skipped(channel, "every check after envelope verification (envelope rejected)")
-        return
+        run.skipped(channel, "every check after envelope verification (envelope rejected)", "core")
+        return None
     run.judged(channel + "/envelope-invalid")
     run.ok("live envelope authenticates: v%s sequence %d" % (manifest["version"], manifest["sequence"]))
     tag = "v" + manifest["version"]
@@ -963,15 +1191,18 @@ def check_channel(cfg, channel, run, now):
                   % (tag, manifest["sequence"], rec["tag"], rec["sequence"]))
     run.judged(channel + "/rollback")
 
-    # 3a. GitHub: latest release + tag → commit
+    # GitHub: latest release + tag → commit
     try:
         latest = gh_json(cfg, "/repos/%s/releases/latest" % repo)
         tag_commit = resolve_tag(cfg, repo, tag)
+    except BudgetExhausted as exc:
+        run.skipped(channel, "every GitHub-dependent check (%s)" % exc, "core")
+        return None
     except WatchError as exc:
         run.alert(channel + "/github-unreachable", "cannot query GitHub: %s" % exc,
                   transient=is_network_error(exc))
-        run.skipped(channel, "every GitHub-dependent check (GitHub unreachable)")
-        return
+        run.skipped(channel, "every GitHub-dependent check (GitHub unreachable)", "core")
+        return None
     run.judged(channel + "/latest-mismatch", channel + "/not-immutable")
     if latest.get("tag_name") != tag or latest.get("draft") is not False:
         run.alert(channel + "/latest-mismatch",
@@ -981,26 +1212,29 @@ def check_channel(cfg, channel, run, now):
         run.alert(channel + "/not-immutable", "release %s is not immutable" % tag)
     if not tag_commit:
         run.alert(channel + "/tag-missing", "refs/tags/%s does not exist" % tag)
-        run.skipped(channel, "release record, list, assets, installer, website (tag missing)")
-        return
+        run.skipped(channel, "release record, list, assets, installer, website (tag missing)", "core")
+        return None
     run.judged(channel + "/tag-missing")
     live = manifest_record(manifest, raw, tag_commit)
 
-    # 2. compare with the recorded authorized release
+    # compare with the recorded authorized release
+    core_complete = True
     if rec is None or rec["sequence"] < live["sequence"]:
         cutoff = chan.get("approval_required_above_sequence")
         if _int(cutoff) is None:
             run.alert(channel + "/config-invalid", "approval_required_above_sequence is missing or not an integer")
-            run.skipped(channel, "release record and later checks (config invalid)")
-            return
+            run.skipped(channel, "release record and later checks (config invalid)", "core")
+            return None
         above = live["sequence"] > cutoff
-        local_ack = None
         if kind == "app" and not above:
             why = corroborate_app(cfg, chan, run, live)          # pre-CI local provenance
             live["provenance"] = "local (pre-CI)"
         else:
             try:
-                why = corroborate_signed_run(cfg, chan, run, live, require_approval=above)
+                why = corroborate_signed_run(cfg, chan, run, live, require_approval=above, channel=channel, now=now)
+            except BudgetExhausted as exc:
+                run.skipped(channel, "corroboration of %s (%s)" % (tag, exc), "core")
+                return None
             except WatchError as exc:
                 # An API error or missing field is never approval.
                 why = "cannot verify the signed run%s: %s" % (" or its approval" if above else "", exc)
@@ -1010,34 +1244,43 @@ def check_channel(cfg, channel, run, now):
                 # unless the owner acknowledged exactly this envelope.
                 local_why = corroborate_app(cfg, chan, run, live)
                 acks = st.setdefault("local_acks", {}).get(channel, {})
-                if local_why is None and acks.get(live["tag"]) == live["envelope_sha256"]:
-                    local_ack = True
+                acked = acks.get(live["tag"]) == live["envelope_sha256"]
+                if acked and (local_why is None or remote(cfg)):
                     live["provenance"] = "local provenance, not phone-approved CI (owner-acknowledged)"
                     why = None
-                elif local_why is None:
+                elif local_why is None or remote(cfg):
                     run.alert(channel + "/local-provenance",
-                              "%s (sequence %d) matches the local publication log but has no corroborated "
-                              "phone-approved CI run (%s) — LOCAL PROVENANCE, NOT PHONE-APPROVED CI; if this was "
-                              "the owner's break-glass release run `release_watch.py acknowledge-local %s %s %s`"
+                              "%s (sequence %d) has no corroborated phone-approved CI run (%s) — LOCAL PROVENANCE, "
+                              "NOT PHONE-APPROVED CI; if this was the owner's break-glass release run "
+                              "`release_watch.py acknowledge-local %s %s %s`"
                               % (tag, live["sequence"], why, channel, live["tag"], live["envelope_sha256"]))
                     why = "local provenance, not phone-approved CI (unacknowledged)"
         if why:
             run.alert(channel + "/uncorroborated-release",
                       "%s (sequence %d) is live but NOT corroborated: %s — not recorded"
                       % (tag, live["sequence"], why))
-            # keep checking the bytes of what is live anyway
         else:
             st["recorded"][channel] = live
             st["full_hash_at"].pop(channel, None)   # force a full hash below
+            st.setdefault("installer_verified", {}).pop(channel, None)
+            tags = st.setdefault("confirmed_tags", {}).setdefault(channel, [])
+            if live["tag"] not in tags:
+                tags.append(live["tag"])
             appr = live.get("approval")
-            run.info("%s: %s (sequence %d, commit %s) corroborated and RECORDED as the authorized release — %s%s"
-                     % (channel, tag, live["sequence"], tag_commit[:12], live["provenance"],
-                        (", approved by user id %d" % appr["user_id"]) if appr else ""))
+            if cfg.get("confirmations"):
+                st.setdefault("pending_confirm", {})[channel] = {
+                    "tag": live["tag"], "sequence": live["sequence"], "commit": live["commit"],
+                    "envelope_sha256": live["envelope_sha256"], "provenance": live["provenance"],
+                    "workflow_run": live.get("workflow_run"), "approval": appr, "first_seen": now}
+            else:
+                run.info("%s: %s (sequence %d, commit %s) corroborated and RECORDED as the authorized release — %s%s"
+                         % (channel, tag, live["sequence"], tag_commit[:12], live["provenance"],
+                            (", approved by user id %d" % appr["user_id"]) if appr else ""))
             rec = live
         run.judged(channel + "/uncorroborated-release", channel + "/local-provenance", channel + "/record-mismatch")
     elif rec["sequence"] > live["sequence"]:
-        # already reported above; the record comparison is not judged
-        run.skipped(channel, "release record comparison (rollback)")
+        run.skipped(channel, "release record comparison (rollback)", "core")
+        core_complete = False
     else:
         run.judged(channel + "/uncorroborated-release", channel + "/local-provenance", channel + "/record-mismatch")
         diffs = [k for k in ("tag", "version", "expires", "published", "envelope_sha256", "assets", "commit")
@@ -1048,35 +1291,50 @@ def check_channel(cfg, channel, run, now):
                       % (tag, live["sequence"], ", ".join(diffs)))
         else:
             run.ok("matches the recorded authorized release (%s, commit %s)" % (rec["tag"], rec["commit"][:12]))
+    if core_complete:
+        run.performed(channel, "core")
+    return {"policy": policy, "kind": kind, "manifest": manifest, "raw": raw, "tag": tag, "live": live,
+            "tag_commit": tag_commit}
 
-    # 3b. latest pointer confusion: no non-draft release may out-version latest
+
+def check_release_list(cfg, channel, run, ctx):
+    """Priority 4: the COMPLETE release list. Its findings are judged only
+    after every page was read and every entry had the documented shape —
+    a failed, malformed or truncated list keeps them exactly as they were."""
+    repo = cfg["channels"][channel]["repo"]
+    tag = ctx["tag"]
     try:
-        # The full release list grows ~22 KB per release (three platforms of
-        # assets each); it passed 512 KiB at 29 releases. Allow the page cap.
-        releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": RELEASE_PAGE_SIZE},
-                           max_bytes=MAX_PAGE_FETCH)
+        releases = _paged(cfg, "/repos/%s/releases" % repo, None, priority=4)
+        if any(not isinstance(r, dict) or not isinstance(r.get("draft"), bool) or "tag_name" not in r
+               for r in releases):
+            raise ShapeError("a release entry has an unexpected shape")
+    except BudgetExhausted as exc:
+        run.skipped(channel, "release list (%s)" % exc, "release-list")
+        return
     except WatchError as exc:
-        run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc,
-                  transient=is_network_error(exc))
-        run.skipped(channel, "release list: latest-frozen, tag shape, immutability (cannot list releases)")
-        releases = None
-    if releases is not None:
-        run.judged(channel + "/github-unreachable", channel + "/latest-frozen", channel + "/release-bad-tag",
-                   channel + "/release-not-immutable", channel + "/release-list-incomplete")
-    else:
-        releases = []
+        if not isinstance(exc, ShapeError):
+            run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc,
+                      transient=is_network_error(exc))
+        run.skipped(channel, "release list: latest-frozen, tag shape, immutability (cannot list releases: %s)" % exc,
+                    "release-list")
+        return
+    run.judged(channel + "/github-unreachable", channel + "/latest-frozen", channel + "/release-bad-tag",
+               channel + "/release-not-immutable", channel + "/release-list-incomplete")
+    run.performed(channel, "release-list")
+    st = run.state.data
+    if channel not in st.setdefault("confirmed_tags", {}):
+        # first complete list: everything published so far is history the
+        # event-feed audit does not re-judge
+        st["confirmed_tags"][channel] = sorted(str(r.get("tag_name")) for r in releases if not r.get("draft"))
     newer = [r["tag_name"] for r in releases
              if not r.get("draft") and semver_tuple(r.get("tag_name"))
              and semver_tuple(r["tag_name"]) > semver_tuple(tag)]
     if newer:
         run.alert(channel + "/latest-frozen",
                   "non-draft release(s) newer than latest %s exist: %s" % (tag, ", ".join(sorted(newer))))
-    drafts = [r["tag_name"] for r in releases if r.get("draft")]
+    drafts = [str(r["tag_name"]) for r in releases if r.get("draft")]
     if drafts:
         run.info("%s: draft release(s) present: %s" % (channel, ", ".join(drafts)))
-    # Every published (non-draft) release — not just latest — must carry a
-    # pipeline-shaped v<semver> tag and be immutable. Drafts are never
-    # immutable and are reported above.
     published = [r for r in releases if not r.get("draft")]
     bad_tags = [str(r.get("tag_name")) for r in published
                 if not isinstance(r.get("tag_name"), str) or not _RELEASE_TAG_RE.match(r["tag_name"])]
@@ -1088,15 +1346,19 @@ def check_channel(cfg, channel, run, now):
     if mutable:
         run.alert(channel + "/release-not-immutable",
                   "published release(s) that are NOT immutable: %s" % ", ".join(sorted(mutable)))
-    if len(releases) >= RELEASE_PAGE_SIZE:
-        # Only the first page is read: say so instead of claiming "all".
-        run.alert(channel + "/release-list-incomplete",
-                  "the release list filled one page (%d); releases beyond it are NOT checked for tag shape, "
-                  "immutability or out-versioning latest — add pagination" % len(releases))
-    elif releases and not bad_tags and not mutable:
+    if releases and not bad_tags and not mutable:
         run.ok("all %d published release(s) are immutable with v<semver> tags" % len(published))
 
-    # 4. assets: probe hourly, full hash daily / after change
+
+def check_rest(cfg, channel, run, now, ctx):
+    """Assets, installer, website, legacy manifest, expiry (no API budget
+    except none — downloads and raw.githubusercontent do not count)."""
+    chan = cfg["channels"][channel]
+    repo = chan["repo"]
+    st = run.state.data
+    policy, manifest, live, tag = ctx["policy"], ctx["manifest"], ctx["live"], ctx["tag"]
+
+    # assets: probe hourly, full hash daily / after change
     problems = []
     network_only = True
     for name, a in live["assets"].items():
@@ -1112,6 +1374,7 @@ def check_channel(cfg, channel, run, now):
         if err:
             problems.append("%s: %s" % (name, err))
     run.judged(channel + "/asset-unreachable")
+    run.performed(channel, "assets")
     if problems:
         run.alert(channel + "/asset-unreachable", "; ".join(problems), transient=network_only)
     else:
@@ -1120,10 +1383,13 @@ def check_channel(cfg, channel, run, now):
     # Per-check cadence: the full hash is due daily (or after the record
     # changed). Not due = still-fresh evidence, NOT a partial run; but
     # freshness never clears an asset-hash finding — only a real full hash.
+    if now - last_full >= FULL_HASH_INTERVAL:
+        run.make_due(channel, "asset-hash")
     if problems and now - last_full >= FULL_HASH_INTERVAL:
-        run.skipped(channel, "full asset hash due but not performed (assets unreachable)")
+        run.skipped(channel, "full asset hash due but not performed (assets unreachable)", "asset-hash")
     if not problems and (now - last_full >= FULL_HASH_INTERVAL):
         run.judged(channel + "/asset-hash")
+        run.performed(channel, "asset-hash")
         bad = []
         for name, a in live["assets"].items():
             try:
@@ -1138,7 +1404,7 @@ def check_channel(cfg, channel, run, now):
             st["full_hash_at"][channel] = now
             run.ok("full download of every asset matches the signed sha256 + size")
 
-    # 5. installer byte-compare (CLI)
+    # installer byte-compare (CLI)
     if chan.get("installer_asset"):
         rel_url = policy.artifact_url_prefix.format(version=manifest["version"]) + chan["installer_asset"]
         src_url = "%s/%s/%s/%s" % (cfg["raw_base"], repo, tag, chan["installer_source"])
@@ -1146,57 +1412,66 @@ def check_channel(cfg, channel, run, now):
             s1, _, released = fetch(rel_url)
             s2, _, source = fetch(src_url)
             run.judged(channel + "/installer")
+            run.performed(channel, "installer")
             if s1 != 200 or s2 != 200:
                 run.alert(channel + "/installer", "installer fetch: release HTTP %s, source HTTP %s" % (s1, s2))
-                run.skipped(channel, "website installers (no verified released installer to compare)")
+                run.skipped(channel, "website installers (no verified released installer to compare)", "website")
             elif released != source:
                 run.alert(channel + "/installer",
                           "released %s differs from %s at %s" % (chan["installer_asset"], chan["installer_source"], tag))
-                run.skipped(channel, "website installers (no verified released installer to compare)")
+                run.skipped(channel, "website installers (no verified released installer to compare)", "website")
             else:
                 run.ok("released installer is byte-identical to %s@%s" % (chan["installer_source"], tag))
-                check_website_installers(run, channel, chan, released)
+                rec = st["recorded"].get(channel)
+                if rec and rec.get("tag") == tag:
+                    st.setdefault("installer_verified", {})[channel] = {
+                        "tag": tag, "sha256": hashlib.sha256(released).hexdigest(), "size": len(released)}
+                if cfg.get("checker_website", True):
+                    check_website_installers(run, channel, chan, released)
+                    run.performed(channel, "website")
         except Exception as exc:  # noqa: BLE001
             run.alert(channel + "/installer", "installer check failed: %s" % exc,
                       transient=is_network_error(exc))
-            run.skipped(channel, "website installers (installer check failed)")
+            run.skipped(channel, "website installers (installer check failed)", "website")
 
-    # 6. website page must link the exact asset (app). One finding key for
-    # all page URLs, so the known ISR lag right after an app release (the
-    # page is revalidated on a visit, ~300 s) still produces ONE alert, as
-    # before, rather than one per hostname.
-    try:
-        page_urls = url_list(chan.get("website_page_url"))
-    except WatchError as exc:
-        run.alert(channel + "/config-invalid", str(exc))
-        run.skipped(channel, "website page (config invalid)")
-        page_urls = None
-    if page_urls is not None:
-        run.judged(channel + "/website-page")
-    else:
-        page_urls = []
-    page_bad, page_net = [], True
-    for page_url in page_urls:
+    # website page must link the exact asset (app). One finding key for
+    # all page URLs (the known ISR lag right after an app release).
+    if cfg.get("checker_website", True):
         try:
-            s, _, page = fetch(page_url, max_bytes=MAX_PAGE_FETCH)
-            urls = [a["url"] for a in live["assets"].values()]
-            if s != 200:
-                page_bad.append("%s → HTTP %s" % (page_url, s))
-                page_net = False
-            elif not all(u.encode() in page for u in urls):
-                page_bad.append("%s does not link the released asset(s) %s" % (page_url, ", ".join(urls)))
-                page_net = False
-            else:
-                run.ok("website page %s links the released asset" % page_url)
-        except Exception as exc:  # noqa: BLE001
-            page_bad.append("%s: page check failed: %s" % (page_url, exc))
-            page_net = page_net and is_network_error(exc)
-    if page_bad:
-        run.alert(channel + "/website-page", "; ".join(page_bad), transient=page_net)
+            page_urls = url_list(chan.get("website_page_url"))
+        except WatchError as exc:
+            run.alert(channel + "/config-invalid", str(exc))
+            run.skipped(channel, "website page (config invalid)", "website")
+            page_urls = None
+        if page_urls is not None:
+            run.judged(channel + "/website-page")
+            if page_urls:
+                run.performed(channel, "website")
+        else:
+            page_urls = []
+        page_bad, page_net = [], True
+        for page_url in page_urls:
+            try:
+                s, _, page = fetch(page_url, max_bytes=MAX_PAGE_FETCH)
+                urls = [a["url"] for a in live["assets"].values()]
+                if s != 200:
+                    page_bad.append("%s → HTTP %s" % (page_url, s))
+                    page_net = False
+                elif not all(u.encode() in page for u in urls):
+                    page_bad.append("%s does not link the released asset(s) %s" % (page_url, ", ".join(urls)))
+                    page_net = False
+                else:
+                    run.ok("website page %s links the released asset" % page_url)
+            except Exception as exc:  # noqa: BLE001
+                page_bad.append("%s: page check failed: %s" % (page_url, exc))
+                page_net = page_net and is_network_error(exc)
+        if page_bad:
+            run.alert(channel + "/website-page", "; ".join(page_bad), transient=page_net)
 
-    # 7. transition: a legacy manifest still in service must agree
+    # transition: a legacy manifest still in service must agree
     if chan.get("legacy_blob_manifest"):
         run.judged(channel + "/legacy-blob")
+        run.performed(channel, "legacy-blob")
         try:
             s, _, body = fetch(chan["legacy_blob_manifest"])
             legacy = json.loads(body.decode("utf-8")) if s == 200 else None
@@ -1211,18 +1486,24 @@ def check_channel(cfg, channel, run, now):
             run.alert(channel + "/legacy-blob", "legacy manifest check failed: %s" % exc,
                       transient=is_network_error(exc))
 
-    # 8. expiry
+    # expiry
     run.judged(channel + "/expiry")
+    run.performed(channel, "expiry")
     days_left = (manifest["expires"] - now) / 86400
     if days_left < float(cfg["expiry_warning_days"]):
         run.alert(channel + "/expiry", "metadata for %s expires in %.1f days (%s) — publish a new release before clients refuse it"
                   % (tag, days_left, iso(manifest["expires"])))
     else:
         run.ok("metadata valid for another %.0f days" % days_left)
-    if not run.partial.get(channel):
-        # Reached the end with every due check performed: no config error
-        # was raised on the way (one raised is in findings and stays).
-        run.judged(channel + "/config-invalid")
+
+
+def check_channel(cfg, channel, run, now):
+    """Backward-compatible single-channel pass (core, list, rest)."""
+    ctx = check_core(cfg, channel, run, now)
+    if ctx:
+        check_release_list(cfg, channel, run, ctx)
+        check_rest(cfg, channel, run, now, ctx)
+    return ctx
 
 
 # ------------------------------------------------------------- commands
@@ -1236,19 +1517,170 @@ def load_config(path):
             if k == "channels":
                 for ch, chv in v.items():
                     cfg["channels"].setdefault(ch, {}).update(chv)
+            elif isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
             else:
                 cfg[k] = v
     return cfg
 
 
+def _guard(run, channel, check, fn, crashed):
+    """Run one check; budget/network failures make it 'not checked', an
+    unreadable GitHub answer is a finding of its own, a crash a watcher error."""
+    try:
+        result = fn()
+        run.judged(channel + "/" + check + "-unreadable")
+        return result
+    except BudgetExhausted as exc:
+        run.skipped(channel, "%s (%s)" % (check, exc), check)
+    except ValueError as exc:      # ShapeError included: GitHub answered, not in the documented shape
+        run.alert(channel + "/" + check + "-unreadable", "%s: GitHub answered in an unexpected shape: %s" % (check, exc))
+        run.skipped(channel, "%s (unreadable answer)" % check, check)
+    except WatchError as exc:
+        if not exc.transient and "HTTP 404" in str(exc):
+            run.alert(channel + "/" + check + "-unreadable", "%s: %s" % (check, exc))
+        run.skipped(channel, "%s (%s)" % (check, exc), check)
+    except Exception as exc:  # noqa: BLE001 — a crash in one check must still alert
+        crashed.add(channel)
+        run.alert(channel + "/watcher-error", "watcher raised %s in %s: %s" % (type(exc).__name__, check, exc))
+        run.skipped(channel, "%s (watcher error)" % check, check)
+    return None
+
+
+def coverage_limit(cfg, check):
+    limits = cfg.get("coverage_limits_hours") or {}
+    hours = limits.get(check, limits.get("hourly", cfg.get("coverage_max_age_hours", 4)))
+    return float(hours) * 3600
+
+
+def evaluate_coverage(cfg, run, now):
+    cov = run.state.data["coverage"]
+    for channel in cfg["channels"]:
+        for check in sorted(run.due.get(channel, set()) | run.done.get(channel, set())):
+            ck = "%s/%s" % (channel, check)
+            key = "%s/coverage/%s" % (channel, check)
+            if check in run.done.get(channel, set()):
+                cov[ck] = now
+                run.judged(key)
+                continue
+            since = cov.setdefault(ck, now)
+            if now - since > coverage_limit(cfg, check):
+                reasons = "; ".join((getattr(run, "reasons", {}) or {}).get((channel, check), [])) or "not performed"
+                run.alert(key, "check '%s' has had no real result since %s (limit %.2f h): %s"
+                          % (check, iso(since), coverage_limit(cfg, check) / 3600, reasons))
+
+
+# ---------------------------------------------- site cache + confirmations
+
+def site_cache_path(state_dir):
+    return os.path.join(os.path.expanduser(state_dir), "site-cache.json")
+
+
+def write_site_cache(cfg, st, now):
+    """What the 5-minute site job compares against: only evidence this
+    checker VERIFIED for the recorded release. A new generation is written
+    (tmp + fsync + rename) only when the content changes."""
+    path = site_cache_path(cfg["state_dir"])
+    chans = {}
+    for channel, chan in cfg["channels"].items():
+        rec = st["recorded"].get(channel)
+        if not rec:
+            continue
+        entry = {"kind": chan.get("kind"), "tag": rec["tag"], "sequence": rec["sequence"],
+                 "envelope_url": chan.get("envelope_url"), "artifact_url_prefix": chan.get("artifact_url_prefix")}
+        if chan.get("installer_asset"):
+            iv = (st.get("installer_verified") or {}).get(channel)
+            entry["installer"] = ({"sha256": iv["sha256"], "size": iv["size"]}
+                                  if iv and iv.get("tag") == rec["tag"] else None)
+            entry["website_install_url"] = url_list(chan.get("website_install_url"))
+            entry["redirect"] = chan.get("website_redirect")
+        if chan.get("website_page_url"):
+            entry["click_urls"] = [a["url"] for a in rec["assets"].values()]
+            entry["website_page_url"] = url_list(chan.get("website_page_url"))
+        chans[channel] = entry
+    content = {"channels": chans, "check_minute": int(cfg.get("check_minute", 23))}
+    old = None
+    try:
+        with open(path) as f:
+            old = json.load(f)
+    except Exception:  # noqa: BLE001 — missing or corrupt: a new generation is written
+        pass
+    if isinstance(old, dict) and old.get("content") == content and isinstance(old.get("generation"), int):
+        return old["generation"]
+    gen = (old.get("generation") + 1) if isinstance(old, dict) and isinstance(old.get("generation"), int) else 1
+    atomic_json(path, {"version": 1, "generation": gen, "written": now, "content": content})
+    return gen
+
+
+def confirm_releases(cfg, run, now, site_gen):
+    """§7: a ✅ only when every relevant check of that channel passed in
+    THIS run, the checker's own website fetch matches, and the site job's
+    current state is clean and fresh. Otherwise nothing (incomplete states
+    are folded into the daily status) until the release has been pending
+    longer than the hourly freshness limit — then one ⚠️."""
+    import sentinel_site   # noqa: PLC0415 — site probe helpers (no state, no lock)
+    st = run.state.data
+    pend = st.get("pending_confirm") or {}
+    hourly_limit = coverage_limit(cfg, "hourly")
+    for channel, pc in list(pend.items()):
+        chan = cfg["channels"].get(channel) or {}
+        rec = st["recorded"].get(channel)
+        if not rec or rec["tag"] != pc["tag"]:
+            pend.pop(channel)
+            continue
+        reasons = []
+        needed = {"core", "release-list", "assets", "expiry"}
+        if st["full_hash_at"].get(channel, 0) < pc["first_seen"] and "asset-hash" not in run.done.get(channel, set()):
+            reasons.append("the full asset hash of this release has not passed yet")
+        if cfg.get("audits", True):
+            needed |= {"env-rules", "signing-audit"}
+        if chan.get("installer_asset"):
+            needed.add("installer")
+        missing = sorted(needed - run.done.get(channel, set()))
+        if missing:
+            reasons.append("not checked in this run: " + ", ".join(missing))
+        open_keys = sorted(k for k in set(st["active"]) | set(run.findings)
+                           if k.startswith(channel + "/") and not run.is_report_only(k))
+        if open_keys:
+            reasons.append("open finding(s): " + ", ".join(open_keys))
+        site_ok, site_why = sentinel_site.confirmation_evidence(cfg, channel, rec, st, now, site_gen)
+        if not site_ok:
+            reasons.append(site_why)
+        if not reasons:
+            appr = pc.get("approval")
+            n_ro = sum(1 for k, v in st["active"].items() if k.startswith(channel + "/") and v.get("report_only"))
+            msg = ("✅ Verified %s %s, sequence %d, commit %s, envelope sha256 %s…%s. %s. Installers/pages on %s match. "
+                   "Verified at %s (Mac 2)."
+                   % (channel, rec["tag"], rec["sequence"], rec["commit"][:12], rec["envelope_sha256"][:4],
+                      rec["envelope_sha256"][-4:],
+                      ("Signed in run %s, one approval by your phone account (%d) in the run's review history, first "
+                       "observed by Sentinel at %s" % (pc.get("workflow_run"), appr["user_id"], local_hm(pc["first_seen"])))
+                      if appr else ("Provenance: %s" % pc.get("provenance")),
+                      " and ".join(sorted({urllib.parse.urlparse(u).hostname for u in
+                                           url_list(chan.get("website_install_url")) + url_list(chan.get("website_page_url"))})) or "—",
+                      local_hm(now)))
+            if "local provenance" in str(pc.get("provenance")):
+                msg = "☑️ Local provenance, NOT phone-approved CI: " + msg[2:]
+            if n_ro and audit_report_only(cfg):
+                msg += " (signing audit in report-only mode: %d open item(s), see the daily status)" % n_ro
+            run.extra_messages.append(msg)
+            pend.pop(channel)
+            continue
+        if now - pc["first_seen"] > hourly_limit and not pc.get("warned"):
+            pc["warned"] = now
+            run.extra_messages.append("⚠️ Release %s %s seq %d seen but NOT fully verified: %s. Do not upgrade to it "
+                                      "until a ✅ names it." % (channel, rec["tag"], rec["sequence"], "; ".join(reasons)))
+
+
+# ------------------------------------------------------------- check run
+
 def cmd_check(cfg):
+    global API
     now = now_ts()
+    API = Api(cfg)
     try:
         state = State(cfg["state_dir"]).__enter__()
     except StateUnreadable as exc:
-        # No memory to run with: an empty state would silently discard the
-        # rollback floor. Say so directly (no state needed to send) and stop;
-        # the beacon goes stale, so the heartbeat repeats the alarm too.
         text = ("🚨 briglia release watch — REFUSING TO RUN: %s. The recorded rollback floor and queued alerts "
                 "are not available; restore state.json from a backup or re-seed only after verifying the live "
                 "releases by hand (runbook §8)." % exc)
@@ -1257,47 +1689,125 @@ def cmd_check(cfg):
         return 1
     try:
         run = Run(cfg, state)
+        st = state.data
         if state.recovered:
-            floor = ", ".join("%s seq %d" % (c, r["sequence"]) for c, r in sorted(state.data["recorded"].items())) or "none"
+            floor = ", ".join("%s seq %d" % (c, r["sequence"]) for c, r in sorted(st["recorded"].items())) or "none"
             run.info("⚠️ %s — recorded floor kept: %s" % (state.recovered, floor))
-        coverage = state.data.setdefault("coverage", {})
-        max_age = float(cfg.get("coverage_max_age_hours", 4)) * 3600
-        for channel in cfg["channels"]:
-            try:
-                check_channel(cfg, channel, run, now)
-                run.judged(channel + "/watcher-error")
-            except Exception as exc:  # noqa: BLE001 — a crash in one channel must still alert
-                run.alert(channel + "/watcher-error", "watcher raised %s: %s" % (type(exc).__name__, exc))
-                run.skipped(channel, "checks after the watcher error")
-            # Coverage freshness: a channel whose due checks have not ALL been
-            # performed for longer than coverage_max_age_hours is a finding of
-            # its own. Only a complete run closes it — and closing it never
-            # clears an integrity finding, which keeps its own owner check.
-            if not run.partial.get(channel):
-                coverage[channel] = now
-                run.judged(channel + "/coverage-stale")
+        channels = list(cfg["channels"])
+        crashed = set()
+        audits = cfg.get("audits", True) is not False
+        for ch in channels:
+            run.make_due(ch, "core", "release-list", "assets", "expiry")
+            chan = cfg["channels"][ch]
+            if chan.get("installer_asset"):
+                run.make_due(ch, "installer")
+            if audits:
+                run.make_due(ch, "env-rules", "signing-audit", "deployments", "events", "deletion")
+                if now - st["coverage"].get(ch + "/env-publish", 0) >= ENV_PUBLISH_INTERVAL - 600:
+                    run.make_due(ch, "env-publish")
+        # 1. environment rules (priority 1)
+        if audits:
+            for ch in channels:
+                if _guard(run, ch, "env-rules", lambda ch=ch: audit.check_env_rules(
+                        API, cfg, ch, cfg["channels"][ch], run) or True, crashed):
+                    run.performed(ch, "env-rules")
+        # 2. core (priority 2)
+        ctxs = {}
+        for ch in channels:
+            ctxs[ch] = _guard(run, ch, "core", lambda ch=ch: check_core(cfg, ch, run, now), crashed)
+        # 3. signing audit (priority 3)
+        if audits:
+            for ch in channels:
+                if _guard(run, ch, "signing-audit", lambda ch=ch: audit.signing_audit(
+                        API, cfg, ch, cfg["channels"][ch], run, st, now), crashed):
+                    run.performed(ch, "signing-audit")
+        # 4. release list + downloads (priority 4)
+        for ch in channels:
+            if ctxs.get(ch):
+                _guard(run, ch, "release-list", lambda ch=ch: check_release_list(cfg, ch, run, ctxs[ch]), crashed)
+                _guard(run, ch, "assets", lambda ch=ch: check_rest(cfg, ch, run, now, ctxs[ch]), crashed)
             else:
-                since = coverage.setdefault(channel, now)
-                if now - since > max_age:
-                    run.alert(channel + "/coverage-stale",
-                              "not every due check has been performed since %s: %s"
-                              % (iso(since), "; ".join(run.partial[channel])))
+                run.skipped(ch, "release list, assets, installer, website, expiry (core check did not complete)",
+                            "release-list", "assets", "installer", "expiry")
+        if audits:
+            # 5. deployments (priority 5) — only on a complete signing audit
+            for ch in channels:
+                if "signing-audit" not in run.done.get(ch, set()):
+                    run.skipped(ch, "deployments (signing audit incomplete this run)", "deployments")
+                elif _guard(run, ch, "deployments", lambda ch=ch: audit.deployments_audit(
+                        API, cfg, ch, cfg["channels"][ch], run, st, now), crashed):
+                    run.performed(ch, "deployments")
+            # 6. events (priority 6)
+            for ch in channels:
+                tags = set((st.get("confirmed_tags") or {}).get(ch, []))
+                if _guard(run, ch, "events", lambda ch=ch, tags=tags: audit.events_audit(
+                        API, cfg, ch, cfg["channels"][ch], run, st, now, tags), crashed):
+                    run.performed(ch, "events")
+            # 7. every 6 h: release-publish + rulesets
+            for ch in channels:
+                if "env-publish" in run.due.get(ch, set()):
+                    if _guard(run, ch, "env-publish", lambda ch=ch: audit.check_env_publish(
+                            API, cfg, ch, cfg["channels"][ch], run) or True, crashed):
+                        run.performed(ch, "env-publish")
+            # 8. deletion re-check rotation
+            for ch in channels:
+                if _guard(run, ch, "deletion", lambda ch=ch: audit.deletion_recheck(
+                        API, cfg, ch, cfg["channels"][ch], run, st, now), crashed):
+                    run.performed(ch, "deletion")
+        for ch in channels:
+            if ch not in crashed:
+                run.judged(ch + "/watcher-error")
+            if not run.missing(ch):
+                run.judged(ch + "/config-invalid")
+        evaluate_coverage(cfg, run, now)
+        site_gen = None
+        if remote(cfg):
+            site_gen = write_site_cache(cfg, st, now)
+        if cfg.get("confirmations"):
+            try:
+                confirm_releases(cfg, run, now, site_gen)
+            except Exception as exc:  # noqa: BLE001 — never lose a run over a confirmation
+                print("  ! confirmation step failed: %s" % exc, file=sys.stderr)
         preserved = run.preserved()
         if preserved:
             print("  ⋯ unresolved, not re-checked this run (kept, no recovery): %s" % ", ".join(sorted(preserved)))
         messages = run.flush(now)
-        state.data["last_run"] = now
-        state.data["last_completed"] = now
-        if not run.findings and not run.partial and not preserved:
-            state.data["last_clean"] = now
+        partial = {ch: run.missing(ch) for ch in channels if run.missing(ch)}
+        st["last_run"] = now
+        st["last_completed"] = now
+        st["completed_total"] = int(st.get("completed_total", 0)) + 1
+        hist = st.setdefault("rate_history", [])
+        if BUDGET.min_seen is not None:
+            hist.append([now, BUDGET.min_seen, BUDGET.requests])
+        del hist[:-60]
+        alerting = sorted(k for k, v in st["active"].items() if not v.get("report_only"))
+        report_open = sorted(k for k, v in st["active"].items() if v.get("report_only"))
+        if not alerting and not partial and not preserved:
+            st["last_clean"] = now
+        prune_state(st)
         state.save()
-        state.write_beacon(now, len(run.findings) + len(preserved), len(state.data["queued"]),
-                           state.data.get("queued_since"))
+        state.write_beacon({
+            "version": WATCH_VERSION, "completed": now, "completed_total": st["completed_total"],
+            "findings": len([k for k in run.findings if not run.is_report_only(k)]) + len(preserved),
+            "open": alerting, "report_only_open": report_open,
+            "coverage_warnings": sorted(k for k in alerting if "/coverage/" in k),
+            "partial": partial, "queued": len(st["queued"]), "oldest_queued": st.get("queued_since"),
+            "recorded": {c: {"tag": r["tag"], "sequence": r["sequence"]} for c, r in st["recorded"].items()},
+            "rate_history": hist[-60:], "requests": BUDGET.requests, "rate_min": BUDGET.min_seen,
+            "audit_mode": "report-only" if audit_report_only(cfg) else "alert",
+            "audit_report_since": cfg.get("audit_report_since"),
+            "baseline": {c: {"complete": bool((a.get("baseline") or {}).get("complete")),
+                             "executions": len((a.get("baseline") or {}).get("executions") or [])}
+                         for c, a in (st.get("audit") or {}).items()},
+            "site_generation": site_gen, "pending_confirm": sorted((st.get("pending_confirm") or {}))})
     finally:
         state.__exit__(None, None, None)
-    print("check complete: %d finding(s), %d unresolved kept, %d partial channel(s), %d message(s), %d queued"
-          % (len(run.findings), len(preserved), len(run.partial), len(messages), len(state.data["queued"])))
-    return 2 if (run.findings or preserved) else 0
+    print("check complete: %d finding(s), %d unresolved kept, %d partial channel(s), %d message(s), %d queued; "
+          "%d GitHub request(s), lowest remaining %s"
+          % (len(run.findings), len(preserved), len(partial), len(messages), len(state.data["queued"]),
+             BUDGET.requests, BUDGET.min_seen))
+    alerting_now = [k for k in run.findings if not run.is_report_only(k)]
+    return 2 if (alerting_now or preserved) else 0
 
 
 def cmd_acknowledge_local(cfg, channel, tag, envelope_sha256):
@@ -1316,6 +1826,26 @@ def cmd_acknowledge_local(cfg, channel, tag, envelope_sha256):
     return 0
 
 
+def cmd_acknowledge_finding(cfg, key):
+    """Owner act: close one event-feed finding (deleted tag, unconfirmed
+    published release, feed gap) — findings no later check can clear."""
+    with State(cfg["state_dir"]) as state:
+        st = state.data
+        channel = key.split("/", 1)[0]
+        aud = (st.get("audit") or {}).get(channel) or {}
+        if key not in (aud.get("event_findings") or {}):
+            print("✖ %s is not an open event-feed finding (open: %s)" % (
+                key, ", ".join(sorted(aud.get("event_findings") or {})) or "none"))
+            return 2
+        aud["event_findings"].pop(key)
+        st["active"].pop(key, None)
+        st.setdefault("acknowledged", []).append({"key": key, "at": now_ts()})
+        del st["acknowledged"][:-100]
+        state.save()
+    print("✔ %s acknowledged and closed" % key)
+    return 0
+
+
 def cmd_status(cfg):
     with State(cfg["state_dir"]) as state:
         print(json.dumps(state.data, indent=2, sort_keys=True))
@@ -1324,18 +1854,28 @@ def cmd_status(cfg):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["check", "status", "acknowledge-local"])
+    ap.add_argument("command", choices=["check", "status", "acknowledge-local", "acknowledge-finding"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--config", help="JSON config overriding DEFAULT_CONFIG")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
-    print("briglia release watch v%s — %s — %s" % (WATCH_VERSION, args.command, iso(now_ts())))
+    if remote(cfg):
+        install_no_exec_hook("Sentinel's checker")
+        rv._PROVIDER = ("python", None)      # never try the openssl subprocess
+        setup_logging(cfg)
+    print("briglia release watch v%s (%s mode) — %s — %s" % (WATCH_VERSION, cfg.get("mode", "local"), args.command,
+                                                            iso(now_ts())))
     try:
         if args.command == "acknowledge-local":
             if len(args.args) != 3:
                 print("✖ usage: acknowledge-local <channel> <vX.Y.Z> <envelope sha256>")
                 return 2
             return cmd_acknowledge_local(cfg, *args.args)
+        if args.command == "acknowledge-finding":
+            if len(args.args) != 1:
+                print("✖ usage: acknowledge-finding <channel>/<key>")
+                return 2
+            return cmd_acknowledge_finding(cfg, args.args[0])
         if args.args:
             print("✖ %s takes no arguments" % args.command)
             return 2

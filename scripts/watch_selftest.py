@@ -54,11 +54,23 @@ class Fake:
         self.raw = {}              # (repo, tag, path) -> bytes
         self.site_installer = None  # bytes served by /site/cli/install.sh (None → redirect to release asset)
         self.site_installer_redirect = None
+        self.latest_installer = None       # bytes behind /latestdl/briglia-cli/install.sh
         self.site_page = b""
         self.domain_installer = None   # bytes served by /domain/cli/install.sh (None → same as the site)
         self.domain_page = None        # bytes served by /domain/app (None → same as the site)
         self.legacy_manifest = None
+        self.branch_policies = {}  # (repo, env) -> [ {name, type} ]
+        self.deployments = {}      # repo -> [deployment objects], any order (served newest id first)
+        self.dep_statuses = {}     # (repo, id) -> [status objects]
+        self.events = {}           # repo -> [event objects] (served newest id first)
+        self.rulesets = {}         # repo -> [ruleset objects]
+        self.rate = None           # {"remaining": n, "limit": 60, "reset": ts} → X-RateLimit-* headers, 403 at 0
+        self.api_hits = 0
+        self.auth_seen = []        # Authorization headers received on /api/
         self.telegram = []         # captured message texts
+        self.tg_tokens = {"tok"}
+        self.tg_updates = [{"update_id": 1, "message": {"chat": {"id": 1, "type": "private", "first_name": "Matteo"},
+                                                        "from": {"username": "matteo"}, "text": "/start"}}]
         self.hits = []             # every GET path, in order
         self.faults = {}           # range_total: int | None; asset_404: name; asset_sub: {name: bytes};
         #                          api_status: int; tg_status: int; ref_status: int
@@ -79,16 +91,27 @@ class Fake:
                     self.wfile.write(body)
 
             def _json(self, status, obj):
-                self._send(status, json.dumps(obj).encode(), "application/json")
+                hdr = {}
+                if fake.rate is not None and self.path.startswith("/api/"):
+                    hdr = {"X-RateLimit-Remaining": str(fake.rate["remaining"]), "X-RateLimit-Limit": str(fake.rate.get("limit", 60)),
+                           "X-RateLimit-Reset": str(int(fake.rate.get("reset", time.time() + 3600)))}
+                self._send(status, json.dumps(obj).encode(), "application/json", headers=hdr)
 
             def do_POST(self):
                 n = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(n) if n else b""
+                m = re.match(r"^/tg/bot([^/]+)/(getMe|getUpdates)$", self.path)
+                if m:
+                    if m.group(1) not in fake.tg_tokens:
+                        return self._json(401, {"ok": False, "description": "Unauthorized"})
+                    if m.group(2) == "getMe":
+                        return self._json(200, {"ok": True, "result": {"id": 1, "is_bot": True, "username": "sentinel_test_bot"}})
+                    return self._json(200, {"ok": True, "result": fake.tg_updates})
                 m = re.match(r"^/tg/bot([^/]+)/sendMessage$", self.path)
                 if m:
                     if fake.faults.get("tg_status"):
                         return self._json(fake.faults["tg_status"], {"ok": False})
-                    if m.group(1) != "tok":
+                    if m.group(1) not in fake.tg_tokens:
                         return self._json(401, {"ok": False})
                     fake.telegram.append(json.loads(body)["text"])
                     return self._json(200, {"ok": True, "result": {}})
@@ -124,6 +147,8 @@ class Fake:
                 if m:
                     data = fake.raw.get((m.group(1), m.group(2), m.group(3)))
                     return self._send(200, data) if data is not None else self._send(404)
+                if p == "/latestdl/briglia-cli/install.sh":      # github.com …/releases/latest/download/install.sh
+                    return self._send(200, fake.latest_installer) if fake.latest_installer is not None else self._send(404)
                 if p == "/site/cli/install.sh":
                     if fake.site_installer is not None:
                         return self._send(200, fake.site_installer)
@@ -147,6 +172,13 @@ class Fake:
                         return self._send(404)
                     return self._send(200, json.dumps(fake.legacy_manifest).encode(), "application/json")
                 if p.startswith("/api/"):
+                    fake.api_hits += 1
+                    if self.headers.get("Authorization"):
+                        fake.auth_seen.append(self.headers.get("Authorization"))
+                    if fake.rate is not None:
+                        if fake.rate["remaining"] <= 0:
+                            return self._json(403, {"message": "API rate limit exceeded"})
+                        fake.rate["remaining"] -= 1
                     if fake.faults.get("api_status"):
                         return self._json(fake.faults["api_status"], {"message": "injected"})
                     m = re.match(r"^/api/repos/([^/]+/[^/]+)/releases/latest$", p)
@@ -155,7 +187,11 @@ class Fake:
                         return self._json(200, rels[-1]) if rels else self._json(404, {})
                     m = re.match(r"^/api/repos/([^/]+/[^/]+)/releases$", p)
                     if m:
-                        return self._json(200, list(reversed(fake.releases.get(m.group(1), []))))
+                        allr = list(reversed(fake.releases.get(m.group(1), [])))
+                        if fake.faults.get("releases_malformed"):
+                            allr = allr[:1] + ["not-an-object"]
+                        page, per = int(q.get("page", ["1"])[0]), int(q.get("per_page", ["30"])[0])
+                        return self._json(200, allr[(page - 1) * per: page * per])
                     m = re.match(r"^/api/repos/([^/]+/[^/]+)/git/ref/tags/([^/]+)$", p)
                     if m:
                         if fake.faults.get("ref_status"):
@@ -184,11 +220,19 @@ class Fake:
                     if m:
                         branch = q.get("branch", [None])[0]
                         page = int(q.get("page", ["1"])[0])
-                        runs = [{k: v for k, v in r.items() if k not in ("jobs", "approvals")}
-                                for r in fake.runs.get(m.group(1), []) if r["head_branch"] == branch
+                        per = int(q.get("per_page", ["30"])[0])
+                        runs = [{k: v for k, v in r.items() if k not in ("jobs", "approvals", "approvals_by_attempt")}
+                                for r in sorted(fake.runs.get(m.group(1), []), key=lambda r: -r["id"])
+                                if (branch is None or r["head_branch"] == branch)
                                 and (m.group(2) is None or fake.faults.get("runs_unfiltered")
                                      or str(r.get("workflow_id")) == m.group(2))]
-                        return self._json(200, {"total_count": len(runs), "workflow_runs": runs if page == 1 else []})
+                        return self._json(200, {"total_count": len(runs), "workflow_runs": runs[(page - 1) * per: page * per]})
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/actions/runs/(\d+)$", p)
+                    if m:
+                        r = next((r for r in fake.runs.get(m.group(1), []) if r["id"] == int(m.group(2))), None)
+                        if not r:
+                            return self._json(404, {"message": "Not Found"})
+                        return self._json(200, {k: v for k, v in r.items() if k not in ("jobs", "approvals", "approvals_by_attempt")})
                     m = re.match(r"^/api/repos/([^/]+/[^/]+)/actions/runs/(\d+)/jobs$", p)
                     if m:
                         r = next((r for r in fake.runs.get(m.group(1), []) if r["id"] == int(m.group(2))), None)
@@ -207,7 +251,42 @@ class Fake:
                         if fake.faults.get("approvals_status"):
                             return self._json(fake.faults["approvals_status"], {"message": "injected"})
                         r = next((r for r in fake.runs.get(m.group(1), []) if r["id"] == int(m.group(2))), None)
-                        return self._json(200, r.get("approvals", [])) if r else self._json(404, {})
+                        if not r:
+                            return self._json(404, {})
+                        # Real GitHub (rehearsal 2026-10-06): the review history lists only
+                        # the reviews of the run's CURRENT attempt; a re-run replaces it.
+                        if "approvals_by_attempt" in r:
+                            return self._json(200, r["approvals_by_attempt"].get(str(r.get("run_attempt", 1)), []))
+                        return self._json(200, r.get("approvals", []))
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/environments/([^/]+)/deployment-branch-policies$", p)
+                    if m:
+                        pols = fake.branch_policies.get((m.group(1), m.group(2)))
+                        if pols is None:
+                            return self._json(404, {"message": "Not Found"})
+                        return self._json(200, {"total_count": len(pols), "branch_policies": pols})
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/deployments$", p)
+                    if m:
+                        env = q.get("environment", [None])[0]
+                        page, per = int(q.get("page", ["1"])[0]), int(q.get("per_page", ["30"])[0])
+                        ds = sorted([d for d in fake.deployments.get(m.group(1), []) if (env is None or d.get("environment") == env)
+                                     and d["id"] not in fake.faults.get("deployments_hide", ())],
+                                    key=lambda d: -d["id"])
+                        return self._json(200, ds[(page - 1) * per: page * per])
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/deployments/(\d+)$", p)
+                    if m:
+                        d = next((d for d in fake.deployments.get(m.group(1), []) if d["id"] == int(m.group(2))), None)
+                        return self._json(200, d) if d else self._json(404, {"message": "Not Found"})
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/deployments/(\d+)/statuses$", p)
+                    if m:
+                        return self._json(200, fake.dep_statuses.get((m.group(1), int(m.group(2))), []))
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/events$", p)
+                    if m:
+                        page, per = int(q.get("page", ["1"])[0]), int(q.get("per_page", ["30"])[0])
+                        evs = sorted(fake.events.get(m.group(1), []), key=lambda e: -int(e["id"]))
+                        return self._json(200, evs[(page - 1) * per: page * per])
+                    m = re.match(r"^/api/repos/([^/]+/[^/]+)/rulesets$", p)
+                    if m:
+                        return self._json(200, fake.rulesets.get(m.group(1), []))
                     m = re.match(r"^/api/repos/([^/]+/[^/]+)/environments/([^/]+)$", p)
                     if m:
                         env = fake.environments.get(m.group(1), {}).get(m.group(2))
@@ -235,8 +314,18 @@ APP_JOB_NAMES = ("Authorize (credential-free)", "Build click (Linux)", "Build cl
                  "Verify public channel")
 
 
+def job_rec(jid, name, attempt=1, conclusion="success", started="2026-10-05T10:00:00Z", completed="2026-10-05T10:00:30Z",
+            runner=None, status="completed"):
+    """A job record in the shape GitHub returns (fields the watcher judges)."""
+    return {"id": jid, "name": name, "run_attempt": attempt, "status": status, "conclusion": conclusion,
+            "started_at": started, "completed_at": completed,
+            "runner_name": runner if runner is not None else "GitHub Actions %d" % jid,
+            "steps": [{"name": "Set up job", "status": "completed", "conclusion": conclusion, "started_at": started}]}
+
+
 def jobs_ok(names, base_id=900000):
-    return [{"id": base_id + i, "name": n, "conclusion": "success", "run_attempt": 1} for i, n in enumerate(names)]
+    return [job_rec(base_id + i, n, started="2026-10-05T10:%02d:00Z" % (i % 60), completed="2026-10-05T10:%02d:30Z" % (i % 60))
+            for i, n in enumerate(names)]
 
 
 JOBS_OK = jobs_ok(CLI_JOB_NAMES)
@@ -279,15 +368,16 @@ def main():
         "state_dir": state_dir, "github_api": B + "/api", "raw_base": B + "/raw",
         "telegram_env_file": tg_env, "telegram_api": B + "/tg",
         "realert_hours": 6, "heartbeat_max_age_hours": 3, "expiry_warning_days": 30,
+        "audits": False,
         "channels": {
-            "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "approval_required_above_sequence": 60,
+            "briglia-cli": {"kind": "cli", "repo": "test/briglia-cli", "workflow_id": 77, "approval_required_above_sequence": 60,
                         "approver_user_id": 4242001,
                         "installer_asset": "install.sh", "installer_source": "scripts/get-briglia.sh",
                         "website_install_url": [B + "/site/cli/install.sh", B + "/domain/cli/install.sh"],
                         "envelope_url": B + "/latest/briglia-cli/manifest.sig.json",
                         "artifact_url_prefix": B + "/download/briglia-cli/v{version}/",
                         "legacy_blob_manifest": None},
-            "briglia-ut": {"kind": "app", "repo": "test/briglia-ut", "publication_log": pub_log,
+            "briglia-ut": {"kind": "app", "repo": "test/briglia-ut", "workflow_id": 77, "publication_log": pub_log,
                        "approval_required_above_sequence": 7, "approver_user_id": 4242001,
                        "website_page_url": [B + "/site/app", B + "/domain/app"],
                        "envelope_url": B + "/latest/briglia-ut/manifest.sig.json",
@@ -456,23 +546,33 @@ def main():
               and not any("recovered" in m and "release-bad-tag" in m for m in fake.telegram)
               and "cannot list releases" in out and "not checked (briglia-cli)" in out, fake.telegram)
         del fake.faults["disconnect_path"]
+        # A MALFORMED list (an entry that is not a release object) is not a
+        # complete, valid list: its findings are kept, never "recovered".
+        fake.faults["releases_malformed"] = True
+        fake.telegram.clear()
+        rc, out = run()
+        check("malformed release list → release-bad-tag kept, no recovery, release-list not checked",
+              "briglia-cli/release-bad-tag" in state()["active"]
+              and not any("recovered" in m and "release-bad-tag" in m for m in fake.telegram)
+              and "not checked (briglia-cli): release list" in out, (fake.telegram, out[-600:]))
+        del fake.faults["releases_malformed"]
         set_state(lambda st: st["active"].pop("briglia-cli/release-bad-tag", None))
         fake.faults["api_status"] = 404
 
         print("— coverage freshness (coverage-stale) —")
-        set_state(lambda st: st.setdefault("coverage", {}).__setitem__("briglia-cli", time.time() - 5 * 3600))
+        set_state(lambda st: st.setdefault("coverage", {}).__setitem__("briglia-cli/core", time.time() - 5 * 3600))
         fake.telegram.clear()
         rc, out = run()
-        check("due checks not performed for > coverage_max_age_hours → coverage-stale alert naming what was skipped",
-              any("briglia-cli/coverage-stale" in m and "GitHub unreachable" in m for m in fake.telegram), fake.telegram)
+        check("due check not performed for > coverage_max_age_hours → coverage/core alert naming why it was skipped",
+              any("briglia-cli/coverage/core" in m and "GitHub unreachable" in m for m in fake.telegram), fake.telegram)
         del fake.faults["api_status"]
         fake.telegram.clear()
         rc, out = run()
         st = state()
-        check("complete run → coverage-stale and release-not-immutable each recover once (real passes)",
-              sum("recovered" in m and "coverage-stale" in m for m in fake.telegram) == 1
+        check("complete run → coverage/core and release-not-immutable each recover once (real passes)",
+              sum("recovered" in m and "coverage/core" in m for m in fake.telegram) == 1
               and sum("recovered" in m and "release-not-immutable" in m for m in fake.telegram) == 1
-              and "briglia-cli/coverage-stale" not in st["active"], fake.telegram)
+              and "briglia-cli/coverage/core" not in st["active"], fake.telegram)
         check("…and only then last_clean advances", rc == 0 and st.get("last_clean", 0) > before_clean, out)
 
         # Not due ≠ partial: the daily full hash not being due keeps the run
@@ -616,9 +716,17 @@ def main():
                   for i in range(100 - len(fake.releases["test/briglia-cli"]))]
         fake.releases["test/briglia-cli"][0:0] = filler
         rc, out = run()
-        check("a FULL first page of releases → release-list-incomplete alert, never 'all … releases' claimed",
-              rc == 2 and any("release-list-incomplete" in m for m in fake.telegram)
-              and "published release(s) are immutable" not in out.split("— briglia-ut")[0], fake.telegram)
+        n_all = len(fake.releases["test/briglia-cli"])
+        check("more than one page of releases → every page is read (pagination), all %d judged, no incomplete alert" % n_all,
+              rc == 0 and not any("release-list-incomplete" in m for m in fake.telegram)
+              and ("all %d published release(s) are immutable" % n_all) in out
+              and fake.hits.count("/api/repos/test/briglia-cli/releases") >= 2, (fake.telegram, out[-800:]))
+        fake.releases["test/briglia-cli"][0]["immutable"] = False
+        fake.telegram.clear()
+        rc, out = run()
+        check("…a mutable release that is only on the SECOND page is found",
+              rc == 2 and any("release-not-immutable" in m and "v0.0.0" in m for m in fake.telegram), fake.telegram)
+        fake.releases["test/briglia-cli"][0]["immutable"] = True
         del fake.releases["test/briglia-cli"][0:len(filler)]; run(); fake.telegram.clear()
         fake.faults["api_status"] = 503
         # network-class: retried in-run and announced only after

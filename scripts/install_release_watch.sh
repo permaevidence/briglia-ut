@@ -6,7 +6,8 @@
 #   com.permaevidence.briglia-release-watch.heartbeat  hourly at :37 → release_heartbeat.py
 #
 # The watcher runs from a SNAPSHOT under ~/.config/briglia-release-watch/bin
-# (release_watch.py, release_heartbeat.py, py/release_verify.py copied from
+# (release_watch.py, watch_audit.py, sentinel_site.py, release_heartbeat.py,
+# py/release_verify.py copied from
 # this checkout and recorded with the git commit), never from the working
 # tree — editing the repo must not silently change what the monitor does.
 #
@@ -98,7 +99,8 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 [ "$(uname)" = "Darwin" ] || { echo "✖ launchd installer is macOS-only (cron/systemd elsewhere)"; exit 1; }
-[ -f scripts/release_watch.py ] && [ -f scripts/release_heartbeat.py ] && [ -f py/release_verify.py ] \
+[ -f scripts/release_watch.py ] && [ -f scripts/release_heartbeat.py ] && [ -f scripts/watch_audit.py ] \
+    && [ -f scripts/sentinel_site.py ] && [ -f py/release_verify.py ] \
     || { echo "✖ run from a briglia-ut checkout"; exit 1; }
 
 mkdir -p "$ROOT" "$LOGS" "$AGENTS"
@@ -128,6 +130,8 @@ rm -rf "$BIN.new"
 mkdir -p "$BIN.new/py"
 for pair in "scripts/release_watch.py:$BIN.new/release_watch.py" \
             "scripts/release_heartbeat.py:$BIN.new/release_heartbeat.py" \
+            "scripts/watch_audit.py:$BIN.new/watch_audit.py" \
+            "scripts/sentinel_site.py:$BIN.new/sentinel_site.py" \
             "py/release_verify.py:$BIN.new/py/release_verify.py"; do
     src="${pair%%:*}"; dst="${pair#*:}"
     old="$BIN/${dst#$BIN.new/}"
@@ -138,7 +142,8 @@ for pair in "scripts/release_watch.py:$BIN.new/release_watch.py" \
     install -m 0644 "$src" "$dst"
 done
 git rev-parse HEAD > "$BIN.new/SNAPSHOT_COMMIT" 2>/dev/null || echo unknown > "$BIN.new/SNAPSHOT_COMMIT"
-"$PY" -m py_compile "$BIN.new/release_watch.py" "$BIN.new/release_heartbeat.py" "$BIN.new/py/release_verify.py"
+"$PY" -m py_compile "$BIN.new/release_watch.py" "$BIN.new/release_heartbeat.py" "$BIN.new/watch_audit.py" \
+    "$BIN.new/sentinel_site.py" "$BIN.new/py/release_verify.py"
 rm -rf "$BIN.old"
 [ -d "$BIN" ] && mv "$BIN" "$BIN.old"
 mv "$BIN.new" "$BIN"
