@@ -685,7 +685,12 @@ def signing_audit(api, cfg, channel, chan, run, st, now):
             complete = False
             continue
         rs = store_result(aud, r, res, now)
-        run.judged(key)
+        # Only a TERMINAL verdict judges the run's key. `pending` and
+        # `executing` are intermediate: they prove nothing about an execution
+        # already judged, so an open finding of this run (e.g. an earlier
+        # unapproved signing) stays open with its first-seen time — never
+        # "recovered" because a new attempt started. A first-time wait for
+        # review stays quiet (nothing open, nothing sent).
         if res["verdict"] == "unverified":
             run.alert(key, "signing/approval UNVERIFIED — %s" % res["reason"])
         elif res["verdict"] == "pending":
@@ -693,8 +698,16 @@ def signing_audit(api, cfg, channel, chan, run, st, now):
                 rs["pending_info_sent"] = now
                 run.info("%s: run %s (%s) has been waiting for the signing review for more than 48 h"
                          % (channel, rid, r.get("head_branch")))
-        else:
+        elif res["verdict"] == "executing":
+            # a signing execution still running is not settled evidence: the
+            # audit stays incomplete this run (no ✅ can rest on it)
+            run.skipped(channel, "signing audit: %s (run %s)" % (res["reason"], rid), "signing-audit")
+            complete = False
+        elif res["verdict"] in ("approved", "legacy", "settled-unexecuted"):
+            run.judged(key)
             run.ok("signing audit: %s" % res["reason"])
+        else:
+            raise ValueError("signing audit: unexpected verdict %r for run %s" % (res["verdict"], rid))
     return complete
 
 

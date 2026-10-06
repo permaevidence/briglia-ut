@@ -1715,6 +1715,111 @@ def recovery_and_confirmation_regressions(scripts):
         check("…the seed completing → exactly ONE recovery", len([x for x in m if "recovered: briglia-cli/baseline-invalid" in x]) == 1, m)
     scenario("baseline", baseline_partial)
 
+    # ------------------------------------------------ signing audit: intermediate verdicts
+    schan = dict(repo=CLI, workflow_id=CLI_WF, workflow_path=WF_PATH, signing_job="Sign metadata",
+                 signing_environment="release-sign", environment_ids={"release-sign": CLI_ENV}, approver_user_id=REV,
+                 signing_cutoff="2026-10-04T23:56:06Z")
+
+    def sign_world(approvals):
+        jobs = full_jobs(["Sign metadata"], 100, "2026-10-06T15:00:00Z", "2026-10-06T15:00:06Z", "GitHub Actions 100")
+        rec_ = run_obj(CLI, 123, "v0.9.0", "a" * 40, CLI_WF, "2026-10-06T14:00:00Z", jobs, approvals_by_attempt={"1": approvals})
+
+        class SignAPI:
+            def paged(self, path, *args, **kw):
+                return rec_["jobs"] if path.endswith("/jobs") else [rec_]
+
+            def tag_commit(self, *args, **kw):
+                return "a" * 40
+
+            def get(self, path, *args, **kw):
+                if path.endswith("/approvals"):
+                    return rec_["approvals_by_attempt"].get(str(rec_["run_attempt"]), [])
+                return rec_
+        return rec_, jobs, SignAPI()
+
+    def sign_check(cfg, st, api, t):
+        r = W.Run(cfg, st)
+        done = W._guard(r, "briglia-cli", "signing-audit",
+                        lambda: A.signing_audit(api, cfg, "briglia-cli", schan, r, st.data, t), set())
+        if done:
+            r.performed("briglia-cli", "signing-audit")
+        return r, r.flush(t)
+
+    def rerun(rec_, jobs, attempt, status):
+        nj = copy.deepcopy(jobs[0])
+        nj.update(id=100 + 100 * attempt, run_attempt=attempt, status=status, conclusion=None if status != "completed" else "success",
+                  started_at="2026-10-06T17:09:00Z", completed_at=None if status != "completed" else "2026-10-06T17:09:06Z",
+                  runner_name="GitHub Actions %d" % (100 * attempt),
+                  steps=[{"status": status, "started_at": "2026-10-06T17:09:00Z"}])
+        rec_.update(run_attempt=attempt, status="in_progress", conclusion=None, updated_at="2026-10-06T17:10:00Z")
+        rec_["jobs"] = jobs + [nj]
+        rec_["approvals_by_attempt"][str(attempt)] = []
+        return nj
+
+    def signing_rerun(report_only):
+        mode = "report-only" if report_only else "alert"
+        cfg = dict(base, signing_audit_alerts=not report_only)
+        key = "briglia-cli/signing/123"
+        d = tempfile.mkdtemp(dir=work)
+        st = types.SimpleNamespace(dir=d, data={"active": {}, "queued": []})
+        aud = A.channel_audit(st.data, "briglia-cli")
+        aud["baseline"] = {"complete": True, "cutoff": schan["signing_cutoff"], "executions": []}
+        rec_, jobs, api = sign_world([])
+        sent.clear()
+        sign_check(cfg, st, api, now)
+        first = (st.data["active"].get(key) or {}).get("first")
+        check("signing [%s]: completed signing with an EMPTY review history → 'SIGNED WITHOUT an approval' is open" % mode,
+              first == now and ("SIGNED WITHOUT" in st.data["active"][key]["text"])
+              and (report_only or any("SIGNED WITHOUT" in x for x in sent)), (st.data["active"].get(key), sent))
+        nj = rerun(rec_, jobs, 2, "in_progress")
+        sent.clear()
+        r, m = sign_check(cfg, st, api, now + 3600)
+        log = os.path.join(d, "audit-report.log")
+        cleared = os.path.exists(log) and "CLEAR " + key in open(log).read()
+        check("signing [%s]: a second signing attempt RUNNING does NOT 'recover' it: still open, original first-seen "
+              "time, no recovery message, no CLEAR in the audit log" % mode,
+              key in st.data["active"] and st.data["active"][key]["first"] == first
+              and not any("recovered" in x for x in m) and not cleared, (m, st.data["active"].get(key)))
+        check("signing [%s]: …and the audit is NOT complete while a signing execution runs (no ✅ can rest on it)" % mode,
+              "signing-audit" not in r.done.get("briglia-cli", set()) and r.partial.get("briglia-cli"), r.partial)
+        rec_.update(status="completed", conclusion="success", updated_at="2026-10-06T18:10:00Z")
+        nj.update(status="completed", conclusion="success", completed_at="2026-10-06T18:09:00Z",
+                  steps=[{"status": "completed", "started_at": "2026-10-06T17:09:00Z"}])
+        sent.clear()
+        r, m = sign_check(cfg, st, api, now + 7200)
+        a = st.data["active"].get(key) or {}
+        check("signing [%s]: the rerun completed → still open (now '2 signing executions'), SAME first-seen time, "
+              "no recovery and no second opening message" % mode,
+              a.get("first") == first and "2 signing executions" in a.get("text", "")
+              and not any("recovered" in x for x in m) and not any(x.startswith("🚨") and key in x and "STILL" not in x for x in m),
+              (m, a))
+    scenario("signing rerun (alert)", lambda: signing_rerun(False))
+    scenario("signing rerun (report-only)", lambda: signing_rerun(True))
+
+    def signing_control():
+        key = "briglia-cli/signing/123"
+        d = tempfile.mkdtemp(dir=work)
+        st = types.SimpleNamespace(dir=d, data={"active": {}, "queued": []})
+        aud = A.channel_audit(st.data, "briglia-cli")
+        aud["baseline"] = {"complete": True, "cutoff": schan["signing_cutoff"], "executions": []}
+        rec_, jobs, api = sign_world([approval(env_id=CLI_ENV)])
+        wait = copy.deepcopy(jobs[0])
+        wait.update(status="waiting", conclusion=None, started_at=None, completed_at=None, runner_name=None, steps=[])
+        rec_.update(status="in_progress", conclusion=None, updated_at="2026-10-06T14:05:00Z")
+        rec_["jobs"] = [wait]
+        sent.clear()
+        r, m = sign_check(base, st, api, now)
+        check("control: a first-time wait for the review is quiet (no finding, no message) and the audit is complete",
+              key not in st.data["active"] and not m and "signing-audit" in r.done.get("briglia-cli", set())
+              and aud["runs"]["123"]["verdict"] == "pending", (m, aud["runs"]["123"].get("verdict")))
+        rec_.update(status="completed", conclusion="success", updated_at="2026-10-06T15:10:00Z")
+        rec_["jobs"] = jobs
+        r, m = sign_check(base, st, api, now + 3600)
+        check("control: approved and executed → verdict approved, judged, no alert, no message",
+              aud["runs"]["123"]["verdict"] == "approved" and "briglia-cli/signing/123" in r.checked and not m,
+              (m, aud["runs"]["123"].get("verdict")))
+    scenario("signing control", signing_control)
+
     # ------------------------------------------------ ✅ needs every due check
     rec = {"tag": "v0.9.0", "version": "0.9.0", "sequence": 9, "commit": "a" * 40, "envelope_sha256": "b" * 64,
            "assets": {"click": {"url": "https://x/click", "size": 1, "sha256": "c" * 64}}}
@@ -1884,8 +1989,9 @@ def recovery_and_confirmation_regressions(scripts):
         sent.clear()
         W.cmd_check(dcfg)
         again = [x for x in sent if x.startswith("✅ Verified")]
-        check("the save AFTER delivery fails → the ✅ may repeat once next run (accepted: duplicate, never lost, never "
-              "unbacked), then the outbox is empty", len(first) == 1 and again == first and not load(d).get("confirm_outbox"),
+        check("the save AFTER delivery fails → delivery repeats until its acknowledgment is saved (accepted: duplicate, "
+              "never lost, never "
+              "unbacked); here once, then the outbox is empty", len(first) == 1 and again == first and not load(d).get("confirm_outbox"),
               (first, again))
     scenario("persist: second save", second_save_fails)
 

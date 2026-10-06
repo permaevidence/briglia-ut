@@ -854,8 +854,10 @@ class Run:
         durable outbox, NOT to flush(): cmd_check saves the state — the
         recorded release, observed approval, rollback floor and the cleared
         pending confirmation — BEFORE delivering it, and keeps an undelivered
-        one for the next run. A crash between delivery and the second save
-        can repeat it (never: send it without its saved evidence)."""
+        one for the next run. A delivered message may repeat until its
+        acknowledgment is saved (a crash or failed save after delivery); it
+        is never sent without its saved evidence. Its text carries the
+        original verification time, which identifies a repeat."""
         print("  ✔ %s" % text)
         self.state.data.setdefault("confirm_outbox", []).append(
             {"channel": channel, "tag": tag, "text": text, "composed": now_ts()})
@@ -1736,8 +1738,9 @@ def confirm_releases(cfg, run, now, site_gen):
 def deliver_outbox(cfg, state):
     """Send the durable positive messages (already saved), oldest first, and
     drop each one only after Telegram confirmed it. The trimmed outbox is
-    saved again; if that second save fails, the delivered ones stay in the
-    saved outbox and may be repeated by the next run — a duplicate, never a
+    saved again; if that save fails, the delivered ones stay in the saved
+    outbox, so delivery may repeat until its acknowledgment is saved — a
+    duplicate (identified by its original verification time), never a
     message without saved evidence and never a lost one."""
     st = state.data
     outbox = list(st.get("confirm_outbox") or [])
@@ -1755,7 +1758,7 @@ def deliver_outbox(cfg, state):
         try:
             state.save()
         except Exception as exc:  # noqa: BLE001 — delivered already; a repeat next run is the accepted cost
-            print("  ! state save after delivering %d positive message(s) failed (%s) — they may be repeated next run"
+            print("  ! state save after delivering %d positive message(s) failed (%s) — delivery may repeat until the acknowledgment is saved"
                   % (len(sent), exc), file=sys.stderr)
     if keep:
         print("  ⋯ %d positive message(s) kept in the outbox for the next run (Telegram did not confirm)" % len(keep))
