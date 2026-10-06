@@ -377,6 +377,121 @@ def main():
         check("second identical run is SILENT (no messages) and skips the daily full hash",
               rc == 0 and not fake.telegram and "full download" not in out and "matches the recorded authorized release" in out, out)
 
+        print("— coverage: a check that did not run never clears its finding (no false 'recovered') —")
+        # Codex 2026-10-06 reproduction: an active, announced finding whose
+        # owning check does not run in this run (here: no check owns the key
+        # at all) used to be erased with "✅ recovered". It must be kept.
+        before_clean = state().get("last_clean")
+        set_state(lambda st: st["active"].__setitem__(
+            "briglia-ut/history", {"first": time.time() - 3600, "last_sent": time.time() - 3600, "text": "old finding"}))
+        fake.telegram.clear()
+        rc, out = run()
+        st = state()
+        check("REPRO: active finding whose check did not run → NO 'recovered' message, finding kept",
+              not any("recovered" in m and "briglia-ut/history" in m for m in fake.telegram)
+              and "briglia-ut/history" in st["active"], fake.telegram)
+        check("…the run reports it as unresolved (exit 2) and last_clean does not advance",
+              rc == 2 and st.get("last_clean") == before_clean and "unresolved, not re-checked" in out, out)
+        set_state(lambda st: st["active"].pop("briglia-ut/history", None))
+        run(); fake.telegram.clear()
+
+        # Real finding → its check skipped by an early return (envelope gone)
+        # → skipped again → envelope back but the finding still true → fixed:
+        # exactly ONE recovery, only on the real pass.
+        fake.domain_installer = b"#!/bin/sh\necho evil\n"
+        rc, out = run()
+        check("website installer swapped on one host → website-installer alert",
+              rc == 2 and any("website-installer" in m for m in fake.telegram), fake.telegram)
+        fake.telegram.clear()
+        before_clean = state().get("last_clean")
+        saved_env = fake.envelopes.pop("briglia-cli")
+        rc, out = run()
+        st = state()
+        check("envelope unreachable (early return) → website-installer NOT recovered, still active",
+              not any("recovered" in m and "website-installer" in m for m in fake.telegram)
+              and "briglia-cli/website-installer" in st["active"] and "envelope-unreachable" in out, fake.telegram)
+        check("…partial run: last_clean unchanged, channel marked not checked",
+              st.get("last_clean") == before_clean and "not checked (briglia-cli)" in out, out)
+        rc, out = run()
+        check("skipped again → still no recovery for website-installer",
+              not any("recovered" in m and "website-installer" in m for m in fake.telegram)
+              and "briglia-cli/website-installer" in state()["active"], fake.telegram)
+        fake.envelopes["briglia-cli"] = saved_env
+        fake.telegram.clear()
+        rc, out = run()
+        check("envelope back, swap still live → envelope-unreachable recovers, website-installer does NOT",
+              any("recovered" in m and "envelope-unreachable" in m for m in fake.telegram)
+              and not any("recovered" in m and "website-installer" in m for m in fake.telegram)
+              and "briglia-cli/website-installer" in state()["active"], fake.telegram)
+        fake.domain_installer = None
+        fake.telegram.clear()
+        rc, out = run()
+        rec_msgs = [m for m in fake.telegram if "recovered" in m and "website-installer" in m]
+        check("swap removed → exactly ONE recovery for website-installer, on the real pass",
+              len(rec_msgs) == 1 and "briglia-cli/website-installer" not in state()["active"] and rc == 0, fake.telegram)
+        fake.telegram.clear()
+
+        # A release-list finding while the GitHub API answers 404 (non-network,
+        # early return before the list): kept; recovers only when listed again.
+        set_state(lambda st: st["active"].__setitem__(
+            "briglia-cli/release-not-immutable", {"first": time.time() - 600, "last_sent": time.time() - 600,
+                                                  "text": "injected"}))
+        fake.faults["api_status"] = 404
+        rc, out = run(); rc, out = run()
+        check("GitHub API failing twice → release-not-immutable kept, no recovery",
+              not any("recovered" in m and "release-not-immutable" in m for m in fake.telegram)
+              and "briglia-cli/release-not-immutable" in state()["active"], fake.telegram)
+
+        del fake.faults["api_status"]
+        # The release LIST alone failing (latest + tag answered): the list
+        # findings are not judged, so they are kept — never "recovered".
+        set_state(lambda st: st["active"].__setitem__(
+            "briglia-cli/release-bad-tag", {"first": time.time() - 600, "last_sent": time.time() - 600,
+                                            "text": "injected"}))
+        fake.faults["disconnect_path"] = "/api/repos/test/briglia-cli/releases"
+        fake.telegram.clear()
+        rc, out = run()
+        check("release list unreachable (latest answered) → release-bad-tag kept, no recovery, run partial",
+              "briglia-cli/release-bad-tag" in state()["active"]
+              and not any("recovered" in m and "release-bad-tag" in m for m in fake.telegram)
+              and "cannot list releases" in out and "not checked (briglia-cli)" in out, fake.telegram)
+        del fake.faults["disconnect_path"]
+        set_state(lambda st: st["active"].pop("briglia-cli/release-bad-tag", None))
+        fake.faults["api_status"] = 404
+
+        print("— coverage freshness (coverage-stale) —")
+        set_state(lambda st: st.setdefault("coverage", {}).__setitem__("briglia-cli", time.time() - 5 * 3600))
+        fake.telegram.clear()
+        rc, out = run()
+        check("due checks not performed for > coverage_max_age_hours → coverage-stale alert naming what was skipped",
+              any("briglia-cli/coverage-stale" in m and "GitHub unreachable" in m for m in fake.telegram), fake.telegram)
+        del fake.faults["api_status"]
+        fake.telegram.clear()
+        rc, out = run()
+        st = state()
+        check("complete run → coverage-stale and release-not-immutable each recover once (real passes)",
+              sum("recovered" in m and "coverage-stale" in m for m in fake.telegram) == 1
+              and sum("recovered" in m and "release-not-immutable" in m for m in fake.telegram) == 1
+              and "briglia-cli/coverage-stale" not in st["active"], fake.telegram)
+        check("…and only then last_clean advances", rc == 0 and st.get("last_clean", 0) > before_clean, out)
+
+        # Not due ≠ partial: the daily full hash not being due keeps the run
+        # complete, but never clears an asset-hash finding (only a real hash).
+        set_state(lambda st: st["active"].__setitem__(
+            "briglia-ut/asset-hash", {"first": time.time() - 600, "last_sent": time.time() - 600, "text": "injected"}))
+        fake.telegram.clear()
+        rc, out = run()
+        check("full hash not due → asset-hash finding kept (freshness never synthesizes recovery), run not partial",
+              "briglia-ut/asset-hash" in state()["active"]
+              and not any("recovered" in m and "asset-hash" in m for m in fake.telegram)
+              and "not checked (briglia-ut)" not in out, fake.telegram)
+        set_state(lambda st: st["full_hash_at"].pop("briglia-ut"))
+        fake.telegram.clear()
+        rc, out = run()
+        check("full hash due and performed → asset-hash recovers once",
+              sum("recovered" in m and "briglia-ut/asset-hash" in m for m in fake.telegram) == 1, fake.telegram)
+        fake.telegram.clear()
+
         print("— envelope integrity —")
         good = fake.envelopes["briglia-cli"]
         t = json.loads(good); t["signature"] = ("A" if t["signature"][0] != "A" else "B") + t["signature"][1:]

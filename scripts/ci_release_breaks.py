@@ -88,6 +88,26 @@ BREAKS = [
     ("quiesce-completed-run-jobs-unchecked", "scripts/release/breakglass-quiesce.py",
      'return all(j["status"] == "completed" for j in jobs), r', 'return True, r',
      "ci_release_selftest.py", "active publisher job of a completed run ignored"),
+    # Coverage (no false "recovered"): each break re-creates one way a
+    # finding could be cleared or a run counted clean without the owning
+    # check actually passing.
+    ("flush-clears-unjudged-findings", "scripts/release_watch.py",
+     "                if key not in self.checked:\n                    # Not judged",
+     "                if False:\n                    # Not judged",
+     "watch_selftest.py", "skipped check announced as recovered"),
+    ("partial-run-counts-clean", "scripts/release_watch.py",
+     "if not run.findings and not run.partial and not preserved:", "if not run.findings:",
+     "watch_selftest.py", "last_clean advanced by a partial run"),
+    ("freshness-clears-asset-hash", "scripts/release_watch.py",
+     [("    if not problems and (now - last_full >= FULL_HASH_INTERVAL):\n        run.judged(channel + \"/asset-hash\")",
+       "    run.judged(channel + \"/asset-hash\")\n    if not problems and (now - last_full >= FULL_HASH_INTERVAL):")], None,
+     "watch_selftest.py", "not-due full hash clears its finding"),
+    ("list-failure-judged", "scripts/release_watch.py",
+     "        releases = None\n    if releases is not None:", "        releases = []\n    if releases is not None:",
+     "watch_selftest.py", "failed release list clears list findings"),
+    ("no-coverage-stale", "scripts/release_watch.py",
+     "                if now - since > max_age:", "                if False:",
+     "watch_selftest.py", "stale coverage never alerted"),
 ]
 
 

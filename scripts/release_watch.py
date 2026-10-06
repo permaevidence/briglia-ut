@@ -518,10 +518,34 @@ class Run:
         self.findings = {}   # key → text (ALERT level)
         self.transient = set()  # keys whose finding is network-class only
         self.infos = []      # one-off informational messages
+        # Coverage: a finding is cleared — and "recovered" announced — ONLY
+        # when the check that owns its key actually ran in this run and
+        # passed. `checked` holds every key judged this run (pass or fail);
+        # a key that was not judged (early return, upstream network failure,
+        # not due) keeps its active finding exactly as it was. `partial`
+        # lists, per channel, due work that was not performed.
+        self.checked = set()
+        self.partial = {}    # channel → [reason, ...]
+
+    def judged(self, *keys):
+        """The checks owning these finding keys ran to a verdict in this run."""
+        self.checked.update(keys)
+
+    def skipped(self, channel, reason):
+        """Due work for `channel` was not performed in this run."""
+        print("  ⋯ not checked (%s): %s" % (channel, reason))
+        self.partial.setdefault(channel, []).append(reason)
+
+    def preserved(self):
+        """Active, announced findings that this run neither re-found nor
+        judged — still unresolved."""
+        return [k for k, v in self.state.data["active"].items()
+                if k not in self.findings and k not in self.checked and v.get("notified", True)]
 
     def alert(self, key, text, transient=False):
         print("  ✖ %s: %s%s" % (key, text, " (network)" if transient else ""))
         self.findings[key] = text
+        self.checked.add(key)
         if transient:
             self.transient.add(key)
         else:
@@ -575,6 +599,11 @@ class Run:
                                 % (iso(prev["first"]), key, text))
         for key in list(active):
             if key not in self.findings:
+                if key not in self.checked:
+                    # Not judged this run (skipped, early return, upstream
+                    # network failure, not due): keep it exactly as it is —
+                    # never a recovery, never a reset.
+                    continue
                 gone = active.pop(key)
                 if not gone.get("notified", True):
                     continue   # never announced, so no recovery message
@@ -874,6 +903,7 @@ def check_website_installers(run, channel, chan, released):
         site_urls = url_list(chan.get("website_install_url"))
     except WatchError as exc:
         run.alert(channel + "/config-invalid", str(exc))
+        run.skipped(channel, "website installers (config invalid)")
         return
     site_bad, site_net = [], True
     for site_url in site_urls:
@@ -888,6 +918,7 @@ def check_website_installers(run, channel, chan, released):
             site_net = False
         else:
             run.ok("website install URL %s resolves to the released installer" % site_url)
+    run.judged(channel + "/website-installer")
     if site_bad:
         run.alert(channel + "/website-installer", "; ".join(site_bad), transient=site_net)
 
@@ -902,6 +933,7 @@ def check_channel(cfg, channel, run, now):
         kind = channel_kind(cfg, channel)
     except WatchError as exc:
         run.alert(channel + "/config-invalid", str(exc))
+        run.skipped(channel, "every check (config invalid)")
         return
 
     # 1. authenticate the live envelope
@@ -910,12 +942,16 @@ def check_channel(cfg, channel, run, now):
     except Exception as exc:  # noqa: BLE001
         run.alert(channel + "/envelope-unreachable", "cannot fetch %s: %s" % (policy.envelope_url, exc),
                   transient=is_network_error(exc))
+        run.skipped(channel, "every check after the envelope fetch (envelope unreachable)")
         return
+    run.judged(channel + "/envelope-unreachable")
     try:
         manifest = rv.verify_envelope(raw, policy, now)
     except rv.ReleaseVerifyError as exc:
         run.alert(channel + "/envelope-invalid", "live envelope REJECTED (%s): %s" % (exc.kind, exc))
+        run.skipped(channel, "every check after envelope verification (envelope rejected)")
         return
+    run.judged(channel + "/envelope-invalid")
     run.ok("live envelope authenticates: v%s sequence %d" % (manifest["version"], manifest["sequence"]))
     tag = "v" + manifest["version"]
     rec = st["recorded"].get(channel)
@@ -925,6 +961,7 @@ def check_channel(cfg, channel, run, now):
         run.alert(channel + "/rollback",
                   "latest serves %s (sequence %d) but %s (sequence %d) was recorded — rollback, replay or deleted release"
                   % (tag, manifest["sequence"], rec["tag"], rec["sequence"]))
+    run.judged(channel + "/rollback")
 
     # 3a. GitHub: latest release + tag → commit
     try:
@@ -933,7 +970,9 @@ def check_channel(cfg, channel, run, now):
     except WatchError as exc:
         run.alert(channel + "/github-unreachable", "cannot query GitHub: %s" % exc,
                   transient=is_network_error(exc))
+        run.skipped(channel, "every GitHub-dependent check (GitHub unreachable)")
         return
+    run.judged(channel + "/latest-mismatch", channel + "/not-immutable")
     if latest.get("tag_name") != tag or latest.get("draft") is not False:
         run.alert(channel + "/latest-mismatch",
                   "GitHub 'latest' is %s (draft=%s) but the envelope served as latest is %s"
@@ -942,7 +981,9 @@ def check_channel(cfg, channel, run, now):
         run.alert(channel + "/not-immutable", "release %s is not immutable" % tag)
     if not tag_commit:
         run.alert(channel + "/tag-missing", "refs/tags/%s does not exist" % tag)
+        run.skipped(channel, "release record, list, assets, installer, website (tag missing)")
         return
+    run.judged(channel + "/tag-missing")
     live = manifest_record(manifest, raw, tag_commit)
 
     # 2. compare with the recorded authorized release
@@ -950,6 +991,7 @@ def check_channel(cfg, channel, run, now):
         cutoff = chan.get("approval_required_above_sequence")
         if _int(cutoff) is None:
             run.alert(channel + "/config-invalid", "approval_required_above_sequence is missing or not an integer")
+            run.skipped(channel, "release record and later checks (config invalid)")
             return
         above = live["sequence"] > cutoff
         local_ack = None
@@ -992,9 +1034,12 @@ def check_channel(cfg, channel, run, now):
                      % (channel, tag, live["sequence"], tag_commit[:12], live["provenance"],
                         (", approved by user id %d" % appr["user_id"]) if appr else ""))
             rec = live
+        run.judged(channel + "/uncorroborated-release", channel + "/local-provenance", channel + "/record-mismatch")
     elif rec["sequence"] > live["sequence"]:
-        pass   # already reported above
+        # already reported above; the record comparison is not judged
+        run.skipped(channel, "release record comparison (rollback)")
     else:
+        run.judged(channel + "/uncorroborated-release", channel + "/local-provenance", channel + "/record-mismatch")
         diffs = [k for k in ("tag", "version", "expires", "published", "envelope_sha256", "assets", "commit")
                  if rec.get(k) != live.get(k)]
         if diffs:
@@ -1013,6 +1058,12 @@ def check_channel(cfg, channel, run, now):
     except WatchError as exc:
         run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc,
                   transient=is_network_error(exc))
+        run.skipped(channel, "release list: latest-frozen, tag shape, immutability (cannot list releases)")
+        releases = None
+    if releases is not None:
+        run.judged(channel + "/github-unreachable", channel + "/latest-frozen", channel + "/release-bad-tag",
+                   channel + "/release-not-immutable", channel + "/release-list-incomplete")
+    else:
         releases = []
     newer = [r["tag_name"] for r in releases
              if not r.get("draft") and semver_tuple(r.get("tag_name"))
@@ -1060,12 +1111,19 @@ def check_channel(cfg, channel, run, now):
                 network_only = False
         if err:
             problems.append("%s: %s" % (name, err))
+    run.judged(channel + "/asset-unreachable")
     if problems:
         run.alert(channel + "/asset-unreachable", "; ".join(problems), transient=network_only)
     else:
         run.ok("%d asset(s) reachable with the signed sizes" % len(live["assets"]))
     last_full = st["full_hash_at"].get(channel, 0)
+    # Per-check cadence: the full hash is due daily (or after the record
+    # changed). Not due = still-fresh evidence, NOT a partial run; but
+    # freshness never clears an asset-hash finding — only a real full hash.
+    if problems and now - last_full >= FULL_HASH_INTERVAL:
+        run.skipped(channel, "full asset hash due but not performed (assets unreachable)")
     if not problems and (now - last_full >= FULL_HASH_INTERVAL):
+        run.judged(channel + "/asset-hash")
         bad = []
         for name, a in live["assets"].items():
             try:
@@ -1087,17 +1145,21 @@ def check_channel(cfg, channel, run, now):
         try:
             s1, _, released = fetch(rel_url)
             s2, _, source = fetch(src_url)
+            run.judged(channel + "/installer")
             if s1 != 200 or s2 != 200:
                 run.alert(channel + "/installer", "installer fetch: release HTTP %s, source HTTP %s" % (s1, s2))
+                run.skipped(channel, "website installers (no verified released installer to compare)")
             elif released != source:
                 run.alert(channel + "/installer",
                           "released %s differs from %s at %s" % (chan["installer_asset"], chan["installer_source"], tag))
+                run.skipped(channel, "website installers (no verified released installer to compare)")
             else:
                 run.ok("released installer is byte-identical to %s@%s" % (chan["installer_source"], tag))
                 check_website_installers(run, channel, chan, released)
         except Exception as exc:  # noqa: BLE001
             run.alert(channel + "/installer", "installer check failed: %s" % exc,
                       transient=is_network_error(exc))
+            run.skipped(channel, "website installers (installer check failed)")
 
     # 6. website page must link the exact asset (app). One finding key for
     # all page URLs, so the known ISR lag right after an app release (the
@@ -1107,6 +1169,11 @@ def check_channel(cfg, channel, run, now):
         page_urls = url_list(chan.get("website_page_url"))
     except WatchError as exc:
         run.alert(channel + "/config-invalid", str(exc))
+        run.skipped(channel, "website page (config invalid)")
+        page_urls = None
+    if page_urls is not None:
+        run.judged(channel + "/website-page")
+    else:
         page_urls = []
     page_bad, page_net = [], True
     for page_url in page_urls:
@@ -1129,6 +1196,7 @@ def check_channel(cfg, channel, run, now):
 
     # 7. transition: a legacy manifest still in service must agree
     if chan.get("legacy_blob_manifest"):
+        run.judged(channel + "/legacy-blob")
         try:
             s, _, body = fetch(chan["legacy_blob_manifest"])
             legacy = json.loads(body.decode("utf-8")) if s == 200 else None
@@ -1144,12 +1212,17 @@ def check_channel(cfg, channel, run, now):
                       transient=is_network_error(exc))
 
     # 8. expiry
+    run.judged(channel + "/expiry")
     days_left = (manifest["expires"] - now) / 86400
     if days_left < float(cfg["expiry_warning_days"]):
         run.alert(channel + "/expiry", "metadata for %s expires in %.1f days (%s) — publish a new release before clients refuse it"
                   % (tag, days_left, iso(manifest["expires"])))
     else:
         run.ok("metadata valid for another %.0f days" % days_left)
+    if not run.partial.get(channel):
+        # Reached the end with every due check performed: no config error
+        # was raised on the way (one raised is in findings and stays).
+        run.judged(channel + "/config-invalid")
 
 
 # ------------------------------------------------------------- commands
@@ -1187,23 +1260,44 @@ def cmd_check(cfg):
         if state.recovered:
             floor = ", ".join("%s seq %d" % (c, r["sequence"]) for c, r in sorted(state.data["recorded"].items())) or "none"
             run.info("⚠️ %s — recorded floor kept: %s" % (state.recovered, floor))
+        coverage = state.data.setdefault("coverage", {})
+        max_age = float(cfg.get("coverage_max_age_hours", 4)) * 3600
         for channel in cfg["channels"]:
             try:
                 check_channel(cfg, channel, run, now)
+                run.judged(channel + "/watcher-error")
             except Exception as exc:  # noqa: BLE001 — a crash in one channel must still alert
                 run.alert(channel + "/watcher-error", "watcher raised %s: %s" % (type(exc).__name__, exc))
+                run.skipped(channel, "checks after the watcher error")
+            # Coverage freshness: a channel whose due checks have not ALL been
+            # performed for longer than coverage_max_age_hours is a finding of
+            # its own. Only a complete run closes it — and closing it never
+            # clears an integrity finding, which keeps its own owner check.
+            if not run.partial.get(channel):
+                coverage[channel] = now
+                run.judged(channel + "/coverage-stale")
+            else:
+                since = coverage.setdefault(channel, now)
+                if now - since > max_age:
+                    run.alert(channel + "/coverage-stale",
+                              "not every due check has been performed since %s: %s"
+                              % (iso(since), "; ".join(run.partial[channel])))
+        preserved = run.preserved()
+        if preserved:
+            print("  ⋯ unresolved, not re-checked this run (kept, no recovery): %s" % ", ".join(sorted(preserved)))
         messages = run.flush(now)
         state.data["last_run"] = now
         state.data["last_completed"] = now
-        if not run.findings:
+        if not run.findings and not run.partial and not preserved:
             state.data["last_clean"] = now
         state.save()
-        state.write_beacon(now, len(run.findings), len(state.data["queued"]), state.data.get("queued_since"))
+        state.write_beacon(now, len(run.findings) + len(preserved), len(state.data["queued"]),
+                           state.data.get("queued_since"))
     finally:
         state.__exit__(None, None, None)
-    print("check complete: %d finding(s), %d message(s), %d queued"
-          % (len(run.findings), len(messages), len(state.data["queued"])))
-    return 2 if run.findings else 0
+    print("check complete: %d finding(s), %d unresolved kept, %d partial channel(s), %d message(s), %d queued"
+          % (len(run.findings), len(preserved), len(run.partial), len(messages), len(state.data["queued"])))
+    return 2 if (run.findings or preserved) else 0
 
 
 def cmd_acknowledge_local(cfg, channel, tag, envelope_sha256):
