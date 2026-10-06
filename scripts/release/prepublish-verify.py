@@ -79,6 +79,44 @@ def authenticate(envelope_path, pub, channel):
 
 # ------------------------------------------------------------------ stage
 
+def check_extras(a, files):
+    """Unsigned extra assets (Sentinel's installer and bundle) must be
+    exactly the files recorded by the assemble job after its cross-OS
+    reproducibility gate (--extras-manifest, `sha256  name` lines), and the
+    installer must embed this release's version and the bundle's sha256."""
+    extras = {}
+    if not a.extra:
+        return extras
+    if not a.extras_manifest:
+        raise GateError("extra assets need --extras-manifest (their recorded sha256)")
+    recorded = {}
+    with open(a.extras_manifest) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) != 2 or len(parts[0]) != 64:
+                raise GateError("malformed extras manifest line: %r" % line)
+            recorded[parts[1]] = parts[0]
+    names = [os.path.basename(e) for e in a.extra]
+    if sorted(names) != sorted(recorded):
+        raise GateError("extra assets %s are not the recorded set %s" % (sorted(names), sorted(recorded)))
+    for e in a.extra:
+        if not os.path.isfile(e) or os.path.islink(e):
+            raise GateError("extra %s is missing or not a regular file" % e)
+        got = sha256_file(e)
+        if got != recorded[os.path.basename(e)]:
+            raise GateError("extra %s does not match its recorded sha256" % os.path.basename(e))
+        extras[os.path.basename(e)] = got
+    inst = [e for e in a.extra if os.path.basename(e) == "install_sentinel.py"]
+    pyz = [e for e in a.extra if os.path.basename(e) == "briglia-sentinel-%s.pyz" % a.version]
+    if inst or pyz:
+        if not (inst and pyz):
+            raise GateError("Sentinel's installer and bundle %s must ship together" % ("briglia-sentinel-%s.pyz" % a.version))
+        text = open(inst[0]).read()
+        if 'VERSION = "%s"' % a.version not in text or 'BUNDLE_SHA256 = "%s"' % sha256_file(pyz[0]) not in text:
+            raise GateError("install_sentinel.py does not embed version %s and the bundle's sha256" % a.version)
+    return extras
+
+
 def cmd_stage(a):
     dist = a.dist
     env_path = os.path.join(dist, "manifest.sig.json")
@@ -125,11 +163,14 @@ def cmd_stage(a):
     for filename in files:
         shutil.copyfile(os.path.join(dist, filename), os.path.join(a.out, filename))
         order.append(filename)
+    extras = check_extras(a, files)
     for extra in a.extra or []:
         name = os.path.basename(extra)
         if name in order or name in ("manifest.json", "manifest.sig.json"):
             raise GateError("extra asset %s collides with a signed asset" % name)
         shutil.copyfile(extra, os.path.join(a.out, name))
+        if sha256_file(os.path.join(a.out, name)) != extras[name]:
+            raise GateError("staged copy of extra %s does not match the recorded sha256" % name)
         order.append(name)
     if a.check_sidecars:
         for name in order:
@@ -266,6 +307,7 @@ def main(argv=None):
     s.add_argument("--channel", default="briglia-ut")
     s.add_argument("--expect-file", action="append")
     s.add_argument("--extra", action="append")
+    s.add_argument("--extras-manifest")
     s.add_argument("--check-sidecars", action="store_true")
     d = sub.add_parser("draft")
     d.add_argument("release_id")

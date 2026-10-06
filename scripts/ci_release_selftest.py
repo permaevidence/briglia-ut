@@ -126,6 +126,14 @@ def static_workflow_checks(path):
         problems.append("sign job does not refuse run_attempt != 1 before touching the key")
     if not re.search(r'cmp -s "linux/\$FILENAME" "macos/\$FILENAME" \|\|', jobs.get("assemble", "")):
         problems.append("assemble lacks the hard reproducibility gate")
+    for jid in ("build", "build-repro"):
+        if 'scripts/sentinel/build_bundle.py dist --version "$VERSION"' not in jobs.get(jid, ""):
+            problems.append("%s does not build Sentinel's installer and bundle" % jid)
+    if not re.search(r'cmp -s "linux/\$f" "macos/\$f" \|\|', jobs.get("assemble", "")) \
+            or "extras.sha256" not in jobs.get("assemble", ""):
+        problems.append("assemble lacks the reproducibility gate / record for Sentinel's assets")
+    if "--extras-manifest dist/extras.sha256" not in jobs.get("publish", ""):
+        problems.append("publish does not stage Sentinel's assets against their recorded sha256")
     if "needs: [authorize, build, build-repro]" not in jobs.get("assemble", ""):
         problems.append("assemble does not need both builds")
     pub = jobs.get("publish", "")
@@ -644,6 +652,52 @@ def main():
         shutil.copy2(bad[3], os.path.join(swapped, "manifest.sig.json"))
         rc, out, _ = stage(swapped, "swapped")
         check("envelope swapped for one signed by another key → refused", rc != 0 and "does not authenticate" in out, out)
+        # Sentinel's extra assets (installer + bundle): recorded sha256, embedded hash
+        sdist = os.path.join(root, "sentinel-dist")
+        p_ = subprocess.run([sys.executable, os.path.join(SRC, "scripts", "sentinel", "build_bundle.py"), sdist,
+                             "--version", "0.8.6"], capture_output=True, text=True)
+        inst_, pyz_ = os.path.join(sdist, "install_sentinel.py"), os.path.join(sdist, "briglia-sentinel-0.8.6.pyz")
+        man_ = os.path.join(sdist, "extras.sha256")
+        open(man_, "w").write("%s  install_sentinel.py\n%s  briglia-sentinel-0.8.6.pyz\n"
+                              % (hashlib.sha256(open(inst_, "rb").read()).hexdigest(),
+                                 hashlib.sha256(open(pyz_, "rb").read()).hexdigest()))
+
+        def stage_x(name, extras, manifest=man_):
+            out_dir = os.path.join(root, "staging-x-" + name)
+            cmd = [sys.executable, os.path.join(REL, "prepublish-verify.py"), "stage", "--dist", good[0], "--pub", pub,
+                   "--version", "0.8.6", "--sequence", "8", "--url-prefix", prefix, "--out", out_dir,
+                   "--expect-file", os.path.basename(good[1])]
+            for e in extras:
+                cmd += ["--extra", e]
+            if manifest:
+                cmd += ["--extras-manifest", manifest]
+            rc_, o_ = sh(cmd)
+            return rc_, o_, out_dir
+        rc, out, xdir = stage_x("ok", [inst_, pyz_])
+        check("Sentinel installer + bundle staged as extras (recorded sha256 and embedded bundle hash match)",
+              p_.returncode == 0 and rc == 0 and os.path.exists(os.path.join(xdir, "install_sentinel.py")), out)
+        rc, out, _ = stage_x("nomanifest", [inst_, pyz_], manifest=None)
+        check("extras without their recorded sha256 → refused", rc != 0 and "--extras-manifest" in out, out)
+        tb = os.path.join(root, "tamper-sentinel")
+        shutil.copytree(sdist, tb)
+        d_ = bytearray(open(os.path.join(tb, "briglia-sentinel-0.8.6.pyz"), "rb").read()); d_[50] ^= 1
+        open(os.path.join(tb, "briglia-sentinel-0.8.6.pyz"), "wb").write(bytes(d_))
+        rc, out, _ = stage_x("tampered-pyz", [os.path.join(tb, "install_sentinel.py"), os.path.join(tb, "briglia-sentinel-0.8.6.pyz")])
+        check("tampered Sentinel bundle → refused at staging", rc != 0 and "recorded sha256" in out, out)
+        tm = os.path.join(root, "tamper-sentinel-2")
+        shutil.copytree(sdist, tm)
+        d_ = bytearray(open(os.path.join(tm, "briglia-sentinel-0.8.6.pyz"), "rb").read()); d_[50] ^= 1
+        open(os.path.join(tm, "briglia-sentinel-0.8.6.pyz"), "wb").write(bytes(d_))
+        open(os.path.join(tm, "extras.sha256"), "w").write("%s  install_sentinel.py\n%s  briglia-sentinel-0.8.6.pyz\n"
+                                                           % (hashlib.sha256(open(inst_, "rb").read()).hexdigest(),
+                                                              hashlib.sha256(bytes(d_)).hexdigest()))
+        rc, out, _ = stage_x("tampered-recorded", [os.path.join(tm, "install_sentinel.py"),
+                                                   os.path.join(tm, "briglia-sentinel-0.8.6.pyz")],
+                             manifest=os.path.join(tm, "extras.sha256"))
+        check("bundle swapped AND re-recorded → refused: the installer's embedded sha256 no longer matches",
+              rc != 0 and "embed" in out, out)
+        rc, out, _ = stage_x("only-installer", [inst_], manifest=None)
+        check("installer without its bundle → refused", rc != 0, out)
         quiesce_tests(root)
         restore_check_tests(root)
         for p in [os.path.join(root, x) for x in os.listdir(root) if x.startswith("staging-")]:

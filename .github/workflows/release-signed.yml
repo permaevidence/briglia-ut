@@ -115,17 +115,22 @@ jobs:
       - name: Build (deterministic)
         env:
           SOURCE_DATE_EPOCH: "0"
+          VERSION: ${{ needs.authorize.outputs.version }}
         run: |
           set -euo pipefail
           python3 --version
           python3 -c 'import zlib; print("zlib", zlib.ZLIB_VERSION, "runtime", zlib.ZLIB_RUNTIME_VERSION)'
           echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
           python3 scripts/build_click.py dist
-          shasum -a 256 dist/*.click
+          python3 scripts/sentinel/build_bundle.py dist --version "$VERSION"
+          shasum -a 256 dist/*.click dist/install_sentinel.py dist/briglia-sentinel-*.pyz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: click-linux
-          path: dist/*.click
+          path: |
+            dist/*.click
+            dist/install_sentinel.py
+            dist/briglia-sentinel-*.pyz
 
   build-repro:
     name: Build click (macOS, reproducibility)
@@ -136,17 +141,22 @@ jobs:
       - name: Rebuild (deterministic)
         env:
           SOURCE_DATE_EPOCH: "0"
+          VERSION: ${{ needs.authorize.outputs.version }}
         run: |
           set -euo pipefail
           python3 --version
           python3 -c 'import zlib; print("zlib", zlib.ZLIB_VERSION, "runtime", zlib.ZLIB_RUNTIME_VERSION)'
           echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
           python3 scripts/build_click.py dist
-          shasum -a 256 dist/*.click
+          python3 scripts/sentinel/build_bundle.py dist --version "$VERSION"
+          shasum -a 256 dist/*.click dist/install_sentinel.py dist/briglia-sentinel-*.pyz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: click-macos
-          path: dist/*.click
+          path: |
+            dist/*.click
+            dist/install_sentinel.py
+            dist/briglia-sentinel-*.pyz
 
   assemble:
     name: Assemble manifest
@@ -176,8 +186,18 @@ jobs:
           cmp -s "linux/$FILENAME" "macos/$FILENAME" || {
             shasum -a 256 "linux/$FILENAME" "macos/$FILENAME"
             echo "✖ the Linux and macOS builds differ — reproducibility gate failed; investigate before releasing"; exit 1; }
+          # Sentinel's installer and bundle: same hard gate, then recorded
+          for f in install_sentinel.py "briglia-sentinel-$VERSION.pyz"; do
+            [ -f "linux/$f" ] && [ -f "macos/$f" ] || { echo "✖ a build did not produce $f"; exit 1; }
+            cmp -s "linux/$f" "macos/$f" || {
+              shasum -a 256 "linux/$f" "macos/$f"
+              echo "✖ the Linux and macOS builds of $f differ — reproducibility gate failed"; exit 1; }
+          done
           mkdir -p dist
           cp "linux/$FILENAME" "dist/$FILENAME"
+          cp linux/install_sentinel.py "linux/briglia-sentinel-$VERSION.pyz" dist/
+          (cd dist && shasum -a 256 install_sentinel.py "briglia-sentinel-$VERSION.pyz") > dist/extras.sha256
+          cat dist/extras.sha256
           SHA256="$(shasum -a 256 "dist/$FILENAME" | awk '{print $1}')"
           SIZE="$(wc -c < "dist/$FILENAME" | tr -d ' ')"
           URL="${URL_PREFIX/\{version\}/$VERSION}$FILENAME"
@@ -293,7 +313,8 @@ jobs:
           STAGING="$RUNNER_TEMP/staging"
           ASSETS="$(python3 scripts/release/prepublish-verify.py stage --dist dist --pub "$EXPECTED_PUB" \
             --channel "$CHANNEL" --version "$VERSION" --sequence "$SEQUENCE" --url-prefix "$URL_PREFIX" \
-            --expect-file "$FILENAME" --out "$STAGING")"
+            --expect-file "$FILENAME" --extra dist/install_sentinel.py --extra "dist/briglia-sentinel-$VERSION.pyz" \
+            --extras-manifest dist/extras.sha256 --out "$STAGING")"
           ASSETS="$ASSETS" PREPUBLISH_VERIFY=scripts/release/prepublish-verify.py PREPUBLISH_STAGING="$STAGING" \
           TITLE="Briglia for Ubuntu Touch" TARGET_COMMITISH="$GITHUB_SHA" \
             ./scripts/release/publish-github-release.sh
