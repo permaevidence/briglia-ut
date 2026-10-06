@@ -289,9 +289,19 @@ def main():
     try:
         # ---------------------------------------------------------- seed
         print("— seed: production pins, exact anchors, credential-free —")
+        write_cfg(seed_runs_per_check=2)
+        rc, out = run()
+        st0 = state()
+        b0 = st0["audit"]["briglia-cli"]["baseline"]
+        check("seed spread over checks: 2 of 3 pre-gate runs read, baseline NOT complete, signing audit not checked "
+              "(no verdict from a partial baseline), and no alert", not b0["complete"] and len(b0["done_runs"]) == 2
+              and not st0["audit"]["briglia-cli"]["runs"].get(str(PIN_RUN), {}).get("verdict")
+              and "signing-audit" in json.load(open(os.path.join(sd, "check.beacon.json")))["partial"]["briglia-cli"]
+              and not tg("🚨"), (b0, fake.telegram))
+        write_cfg()
         rc, out = run(env=dict(clean_env, GH_TOKEN="ghp_should_never_be_sent", GITHUB_TOKEN="ghs_nor_this"))
         st = state()
-        check("first run completes (exit 0) with both channels recorded", rc == 0 and st["recorded"]["briglia-cli"]["sequence"] == 109
+        check("next run completes the seed (exit 0) with both channels recorded", rc == 0 and st["recorded"]["briglia-cli"]["sequence"] == 109
               and st["recorded"]["briglia-ut"]["sequence"] == 8, out[-1500:])
         check("GH_TOKEN/GITHUB_TOKEN set → NO Authorization header ever reached the fake GitHub (remote mode)",
               fake.auth_seen == [] and "IGNORED" in out, fake.auth_seen)
@@ -322,7 +332,7 @@ def main():
               == sha(INST["0.2.49"]))
         beacon = json.load(open(os.path.join(sd, "check.beacon.json")))
         check("beacon carries counts for the daily status (completed_total, recorded, rate history, audit mode)",
-              beacon["completed_total"] == 1 and beacon["recorded"]["briglia-cli"]["sequence"] == 109 and "rate_history" in beacon)
+              beacon["completed_total"] == 2 and beacon["recorded"]["briglia-cli"]["sequence"] == 109 and "rate_history" in beacon)
         rc, out = site()
         check("site job: both hosts serve the verified installer and link the click → exit 0, beacon written",
               rc == 0 and os.path.exists(os.path.join(sd, "site.beacon.json")), out)

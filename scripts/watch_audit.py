@@ -539,10 +539,19 @@ def seed_baseline(api, cfg, channel, chan, run, aud, runs, now):
     sign_name = chan.get("signing_job") or ""
     todo = [r for r in runs if (parse_ts(r.get("created_at")) or 0) < cutoff or _int(r.get("id")) in pinned_runs]
     run.judged(channel + "/baseline-invalid")
+    # Seeding reads one job list per pre-gate run. It is spread over several
+    # hourly checks (at most `seed_runs_per_check` runs each) so the rest of
+    # the hourly checks keep their share of the 60/hour budget meanwhile.
+    budget_left = int(cfg.get("seed_runs_per_check", 15))
     for r in todo:
         rid = _int(r.get("id"))
         if rid is None or rid in b["done_runs"]:
             continue
+        if budget_left <= 0:
+            run.ok("legacy baseline: %d of %d pre-gate run(s) read so far; continuing next check"
+                   % (len(b["done_runs"]), len(todo)))
+            return False
+        budget_left -= 1
         jobs = api.paged("/repos/%s/actions/runs/%d/jobs" % (chan["repo"], rid), "jobs", {"filter": "all"}, priority=3)
         recs = [compact_record(j) for j in jobs if isinstance(j, dict) and j.get("name") == sign_name]
         for rec in recs:
