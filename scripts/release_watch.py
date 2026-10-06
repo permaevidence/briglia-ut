@@ -291,8 +291,19 @@ def gh_json(cfg, path, params=None, max_bytes=MAX_SMALL_FETCH):
         raise WatchError("GitHub API %s → invalid JSON" % path)
 
 
+def gh_shape(value, kind, path):
+    """A GitHub answer of the wrong JSON shape is a failed check (an error
+    finding, never a pass): validate before anything interprets it."""
+    if not isinstance(value, kind):
+        raise WatchError("GitHub API %s → unexpected response shape (%s, expected %s)"
+                         % (path, type(value).__name__, kind.__name__))
+    return value
+
+
 def semver_tuple(version):
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version or "")
+    if not isinstance(version, str):
+        return None
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version)
     return tuple(int(x) for x in m.groups()) if m else None
 
 
@@ -672,7 +683,7 @@ def manifest_record(manifest, envelope_raw, tag_commit):
 def resolve_tag(cfg, repo, tag):
     """Commit a tag names, following annotated tags; None if the tag is absent."""
     try:
-        ref = gh_json(cfg, "/repos/%s/git/ref/tags/%s" % (repo, tag))
+        ref = gh_shape(gh_json(cfg, "/repos/%s/git/ref/tags/%s" % (repo, tag)), dict, "ref " + tag)
     except WatchError as exc:
         if "HTTP 404" in str(exc):
             return None
@@ -681,6 +692,7 @@ def resolve_tag(cfg, repo, tag):
         raise WatchError("ref lookup answered %r for %s" % (ref.get("ref"), tag))
     obj = ref.get("object") or {}
     for _ in range(6):
+        gh_shape(obj, dict, "ref object " + tag)
         sha, typ = str(obj.get("sha", "")), obj.get("type")
         if not _SHA_RE.match(sha):
             raise WatchError("malformed ref object for %s" % tag)
@@ -688,7 +700,7 @@ def resolve_tag(cfg, repo, tag):
             return sha
         if typ != "tag":
             raise WatchError("unexpected ref object type %r for %s" % (typ, tag))
-        obj = (gh_json(cfg, "/repos/%s/git/tags/%s" % (repo, sha)).get("object")) or {}
+        obj = (gh_shape(gh_json(cfg, "/repos/%s/git/tags/%s" % (repo, sha)), dict, "tag " + sha).get("object")) or {}
     raise WatchError("annotated tag chain too deep for %s" % tag)
 
 
@@ -965,20 +977,22 @@ def check_channel(cfg, channel, run, now):
 
     # 3a. GitHub: latest release + tag → commit
     try:
-        latest = gh_json(cfg, "/repos/%s/releases/latest" % repo)
+        latest = gh_shape(gh_json(cfg, "/repos/%s/releases/latest" % repo), dict, "releases/latest")
         tag_commit = resolve_tag(cfg, repo, tag)
     except WatchError as exc:
         run.alert(channel + "/github-unreachable", "cannot query GitHub: %s" % exc,
                   transient=is_network_error(exc))
         run.skipped(channel, "every GitHub-dependent check (GitHub unreachable)")
         return
-    run.judged(channel + "/latest-mismatch", channel + "/not-immutable")
     if latest.get("tag_name") != tag or latest.get("draft") is not False:
         run.alert(channel + "/latest-mismatch",
                   "GitHub 'latest' is %s (draft=%s) but the envelope served as latest is %s"
                   % (latest.get("tag_name"), latest.get("draft"), tag))
     if latest.get("immutable") is not True:
         run.alert(channel + "/not-immutable", "release %s is not immutable" % tag)
+    # judged only once both verdicts exist (a judgment before the verdict
+    # would let a crash in between clear the finding)
+    run.judged(channel + "/latest-mismatch", channel + "/not-immutable")
     if not tag_commit:
         run.alert(channel + "/tag-missing", "refs/tags/%s does not exist" % tag)
         run.skipped(channel, "release record, list, assets, installer, website (tag missing)")
@@ -1055,15 +1069,17 @@ def check_channel(cfg, channel, run, now):
         # assets each); it passed 512 KiB at 29 releases. Allow the page cap.
         releases = gh_json(cfg, "/repos/%s/releases" % repo, {"per_page": RELEASE_PAGE_SIZE},
                            max_bytes=MAX_PAGE_FETCH)
+        # Every element is interpreted below: validate the whole shape first.
+        gh_shape(releases, list, "releases")
+        for r in releases:
+            gh_shape(r, dict, "releases[]")
     except WatchError as exc:
         run.alert(channel + "/github-unreachable", "cannot list releases: %s" % exc,
                   transient=is_network_error(exc))
         run.skipped(channel, "release list: latest-frozen, tag shape, immutability (cannot list releases)")
         releases = None
-    if releases is not None:
-        run.judged(channel + "/github-unreachable", channel + "/latest-frozen", channel + "/release-bad-tag",
-                   channel + "/release-not-immutable", channel + "/release-list-incomplete")
-    else:
+    list_read = releases is not None
+    if not list_read:
         releases = []
     newer = [r["tag_name"] for r in releases
              if not r.get("draft") and semver_tuple(r.get("tag_name"))
@@ -1088,13 +1104,25 @@ def check_channel(cfg, channel, run, now):
     if mutable:
         run.alert(channel + "/release-not-immutable",
                   "published release(s) that are NOT immutable: %s" % ", ".join(sorted(mutable)))
-    if len(releases) >= RELEASE_PAGE_SIZE:
+    list_complete = list_read and len(releases) < RELEASE_PAGE_SIZE
+    if list_read and not list_complete:
         # Only the first page is read: say so instead of claiming "all".
         run.alert(channel + "/release-list-incomplete",
                   "the release list filled one page (%d); releases beyond it are NOT checked for tag shape, "
                   "immutability or out-versioning latest — add pagination" % len(releases))
+        run.skipped(channel, "releases beyond the first page of %d (tag shape, immutability, newer than latest)"
+                    % RELEASE_PAGE_SIZE)
     elif releases and not bad_tags and not mutable:
         run.ok("all %d published release(s) are immutable with v<semver> tags" % len(published))
+    # Judged only AFTER the whole list was interpreted. The aggregate list
+    # findings can only be judged on a COMPLETE list: a full page says
+    # nothing about releases beyond it, so a finding about one of them is
+    # kept (findings actually observed on the page still alert above).
+    if list_read:
+        run.judged(channel + "/github-unreachable")
+    if list_complete:
+        run.judged(channel + "/latest-frozen", channel + "/release-bad-tag",
+                   channel + "/release-not-immutable", channel + "/release-list-incomplete")
 
     # 4. assets: probe hourly, full hash daily / after change
     problems = []
@@ -1145,7 +1173,6 @@ def check_channel(cfg, channel, run, now):
         try:
             s1, _, released = fetch(rel_url)
             s2, _, source = fetch(src_url)
-            run.judged(channel + "/installer")
             if s1 != 200 or s2 != 200:
                 run.alert(channel + "/installer", "installer fetch: release HTTP %s, source HTTP %s" % (s1, s2))
                 run.skipped(channel, "website installers (no verified released installer to compare)")
@@ -1155,6 +1182,8 @@ def check_channel(cfg, channel, run, now):
                 run.skipped(channel, "website installers (no verified released installer to compare)")
             else:
                 run.ok("released installer is byte-identical to %s@%s" % (chan["installer_source"], tag))
+            run.judged(channel + "/installer")
+            if s1 == 200 and s2 == 200 and released == source:
                 check_website_installers(run, channel, chan, released)
         except Exception as exc:  # noqa: BLE001
             run.alert(channel + "/installer", "installer check failed: %s" % exc,
@@ -1212,13 +1241,13 @@ def check_channel(cfg, channel, run, now):
                       transient=is_network_error(exc))
 
     # 8. expiry
-    run.judged(channel + "/expiry")
     days_left = (manifest["expires"] - now) / 86400
     if days_left < float(cfg["expiry_warning_days"]):
         run.alert(channel + "/expiry", "metadata for %s expires in %.1f days (%s) — publish a new release before clients refuse it"
                   % (tag, days_left, iso(manifest["expires"])))
     else:
         run.ok("metadata valid for another %.0f days" % days_left)
+    run.judged(channel + "/expiry")
     if not run.partial.get(channel):
         # Reached the end with every due check performed: no config error
         # was raised on the way (one raised is in findings and stays).
@@ -1263,10 +1292,15 @@ def cmd_check(cfg):
         coverage = state.data.setdefault("coverage", {})
         max_age = float(cfg.get("coverage_max_age_hours", 4)) * 3600
         for channel in cfg["channels"]:
+            judged_before = set(run.checked)
             try:
                 check_channel(cfg, channel, run, now)
                 run.judged(channel + "/watcher-error")
             except Exception as exc:  # noqa: BLE001 — a crash in one channel must still alert
+                # A crashed channel run proves nothing: withdraw every
+                # judgment it made, so no finding of it is cleared ("recovered")
+                # by this run. Findings it actually observed still alert.
+                run.checked = judged_before | set(run.findings)
                 run.alert(channel + "/watcher-error", "watcher raised %s: %s" % (type(exc).__name__, exc))
                 run.skipped(channel, "checks after the watcher error")
             # Coverage freshness: a channel whose due checks have not ALL been
