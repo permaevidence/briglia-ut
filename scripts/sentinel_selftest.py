@@ -1252,8 +1252,9 @@ def main():
         big = {"audit": {"briglia-cli": {"runs": {str(i): {"validated_fp": [1], "verdict": "approved", "sig_cache": {"x": 1}}
                                                   for i in range(1000)}, "deployments": {}}}, "confirmed_tags": {"x": ["t"] * 900}}
         RW.prune_state(big)
-        check("state stays bounded: settled runs beyond 400 and old tags are pruned, job caches dropped once settled",
-              len(big["audit"]["briglia-cli"]["runs"]) == 400 and len(big["confirmed_tags"]["x"]) == 500
+        check("state stays bounded: job caches dropped once settled, old tags capped at 500; run records mirror "
+              "GitHub's capped listing and are kept (never re-validated hourly)",
+              len(big["audit"]["briglia-cli"]["runs"]) == 1000 and len(big["confirmed_tags"]["x"]) == 500
               and not any("sig_cache" in r for r in big["audit"]["briglia-cli"]["runs"].values()))
         stray = os.path.join(sd, "logs", "launchd-check.log")
         open(stray, "w").write("x" * (1024 * 1024 + 10))

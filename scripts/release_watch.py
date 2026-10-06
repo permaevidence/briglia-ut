@@ -107,7 +107,6 @@ FULL_HASH_INTERVAL = 24 * 3600
 ENV_PUBLISH_INTERVAL = 6 * 3600
 BUDGET_RESERVE = 5
 MAX_QUEUED = 200
-MAX_RUNS_KEPT = 400                   # per channel, settled runs beyond this are forgotten (state stays bounded)
 LOG_MAX_BYTES = 1024 * 1024
 LOG_KEEP = 2
 
@@ -702,23 +701,17 @@ class State:
 
 
 def prune_state(st):
-    """Keep the state file bounded: settled run records beyond the newest
-    MAX_RUNS_KEPT per channel are forgotten (a forgotten run that changes
-    again is simply validated as new), job caches are kept only for open
-    runs, settled deployments only for the newest 200."""
+    """Keep the state file bounded. Run and deployment records mirror what
+    GitHub lists (the run listing is itself capped at 10 pages, the
+    deployment listing pages back only to the pinned boundary), so they are
+    never dropped — a dropped record that GitHub still lists would be
+    re-validated every hour. What does not mirror GitHub is capped: job-record
+    caches are kept only for open runs, confirmed tags at 500, queues at
+    MAX_QUEUED (in flush)."""
     for aud in (st.get("audit") or {}).values():
-        runs = aud.get("runs") or {}
-        for rid, rs in runs.items():
+        for rs in (aud.get("runs") or {}).values():
             if rs.get("validated_fp") and rs.get("sig_cache"):
                 rs.pop("sig_cache", None)
-        settled = sorted((int(r) for r, rs in runs.items() if rs.get("validated_fp") and rs.get("verdict") != "unverified"
-                          and not rs.get("deleted")), reverse=True)
-        for rid in settled[MAX_RUNS_KEPT:]:
-            runs.pop(str(rid), None)
-        deps = aud.get("deployments") or {}
-        sd = sorted((int(d) for d, i in deps.items() if i.get("settled") and not i.get("deleted")), reverse=True)
-        for did in sd[200:]:
-            deps.pop(str(did), None)
     for tags in (st.get("confirmed_tags") or {}).values():
         del tags[:-500]
 
